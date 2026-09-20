@@ -1,0 +1,8 @@
+# 运行产物
+vscode.zip
+Application/
+*.exe
+
+# 编译中间文件
+*.o
+*.obj

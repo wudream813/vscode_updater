@@ -1,0 +1,45 @@
+name: build-release
+
+# 推送 v* 标签时自动编译 Windows 可执行文件并上传到对应 Release；
+# 也可在 Actions 页面手动触发（workflow_dispatch），仅产出构建产物。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build vscode_updater.exe (MinGW-w64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 + MinGW-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          install: mingw-w64-x86_64-gcc
+
+      - name: Compile (static)
+        shell: msys2 {0}
+        run: |
+          g++ -std=c++17 -O2 -Wall -static update.cpp -lwininet -o vscode_updater.exe
+          ls -lh vscode_updater.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vscode_updater.exe
+          path: vscode_updater.exe
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: vscode_updater.exe
+          fail_on_unmatched_files: true
