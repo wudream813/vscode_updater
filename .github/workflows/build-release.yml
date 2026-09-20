@@ -1,45 +1,114 @@
-name: build-release
+name: build-test-release
 
-# 推送 v* 标签时自动编译 Windows 可执行文件并上传到对应 Release；
-# 也可在 Actions 页面手动触发（workflow_dispatch），仅产出构建产物。
 on:
   push:
-    tags:
-      - "v*"
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
-  build:
-    name: Build vscode_updater.exe (MinGW-w64)
-    runs-on: windows-latest
+  portable-tests:
+    name: Portable regression tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup MSYS2 + MinGW-w64
-        uses: msys2/setup-msys2@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          install: mingw-w64-x86_64-gcc
-
-      - name: Compile (static)
-        shell: msys2 {0}
+          persist-credentials: false
+      - name: Compile and run with sanitizers
         run: |
-          g++ -std=c++17 -O2 -Wall -static update.cpp -lwininet -o vscode_updater.exe
-          ls -lh vscode_updater.exe
+          g++ -std=c++17 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer tests/core_tests.cpp -o core-tests
+          ./core-tests
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+  windows-tests:
+    name: Windows (${{ matrix.compiler }})
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [mingw, msvc]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          name: vscode_updater.exe
-          path: vscode_updater.exe
+          persist-credentials: false
+      - name: Generate offline ZIP fixtures
+        run: python tests/make_fixtures.py tests/fixtures
+      - name: Set up MinGW-w64
+        if: matrix.compiler == 'mingw'
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc make
+      - name: MinGW build
+        if: matrix.compiler == 'mingw'
+        shell: msys2 {0}
+        run: make all core-tests.exe windows-tests.exe
+      - name: MinGW offline tests
+        if: matrix.compiler == 'mingw'
+        shell: pwsh
+        run: |
+          ./core-tests.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Core tests failed' }
+          ./windows-tests.exe tests/fixtures
+          if ($LASTEXITCODE -ne 0) { throw 'Windows integration tests failed' }
+          python tests/smoke.py ./vscode_updater.exe
+          if ($LASTEXITCODE -ne 0) { throw 'CLI tests failed' }
+      - name: MSVC build and offline tests
+        if: matrix.compiler == 'msvc'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'Visual Studio C++ tools not found' }
+          $command = '"' + $vs + '\VC\Auxiliary\Build\vcvars64.bat" && call tests\run_msvc.bat'
+          cmd /c $command
+          if ($LASTEXITCODE -ne 0) { throw 'MSVC build/tests failed' }
+      - name: Produce SHA-256 manifest
+        if: matrix.compiler == 'mingw'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash vscode_updater.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  vscode_updater.exe" | Set-Content SHA256SUMS.txt -Encoding ascii
+      - name: Upload tested executable
+        if: matrix.compiler == 'mingw'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: vscode-updater-windows-x64
+          path: |
+            vscode_updater.exe
+            SHA256SUMS.txt
           if-no-files-found: error
+          retention-days: 14
 
-      - name: Attach to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+  release:
+    name: Attach tested files to an existing Release
+    needs: [portable-tests, windows-tests]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          files: vscode_updater.exe
-          fail_on_unmatched_files: true
+          name: vscode-updater-windows-x64
+      # Do not create Releases on behalf of a bot: create the Release using the
+      # owner's account first, then rerun this job if necessary. The author stays unchanged.
+      - name: Upload executable and checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" >/dev/null || { echo 'Create this Release using your account, then rerun this job.'; exit 1; }
+          gh release upload "$TAG" vscode_updater.exe SHA256SUMS.txt --clobber

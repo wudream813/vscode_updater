@@ -1,8 +1,16 @@
-# 运行产物
+# Runtime output and recovery directories (may contain private user data)
 vscode.zip
 Application/
-*.exe
+.*.update-*/
+.*.updater.lock
 
-# 编译中间文件
+# Build and test output
+*.exe
 *.o
 *.obj
+*.pdb
+*.ilk
+core-tests
+SHA256SUMS.txt
+tests/fixtures/
+__pycache__/

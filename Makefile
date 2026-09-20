@@ -1,25 +1,26 @@
-# VS Code 自动更新程序 - Makefile (MinGW-w64)
-# 用法:
-#   make          编译生成 vscode_updater.exe
-#   make clean    清理编译产物
-# 需要: MinGW-w64 g++（winlibs / MSYS2 / mingw-builds）
-# 提示: 若报 "undefined reference to std::filesystem"，说明编译器较老，
-#       请在 LDFLAGS 中追加 -lstdc++fs
-
+# Windows build with MinGW-w64; the portable tests also run on Linux/macOS.
 CXX      ?= g++
-CXXFLAGS ?= -std=c++17 -O2 -Wall
+CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra
 LDFLAGS  ?= -static
-LIBS      = -lwininet
-
+LIBS      = -lwininet -lbcrypt -lshell32
 TARGET    = vscode_updater.exe
-SOURCES   = update.cpp
+HEADERS   = updater_core.hpp miniz.c miniz.h json.hpp
 
 all: $(TARGET)
 
-$(TARGET): $(SOURCES) miniz.c miniz.h json.hpp Makefile
-	$(CXX) $(CXXFLAGS) $(SOURCES) $(LIBS) $(LDFLAGS) -o $(TARGET)
+$(TARGET): update.cpp $(HEADERS) Makefile
+	$(CXX) $(CXXFLAGS) update.cpp $(LDFLAGS) $(LIBS) -o $@
+
+core-tests.exe: tests/core_tests.cpp updater_core.hpp
+	$(CXX) $(CXXFLAGS) $< $(LDFLAGS) -o $@
+
+windows-tests.exe: tests/windows_tests.cpp update.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) $< $(LDFLAGS) $(LIBS) -o $@
+
+test: core-tests.exe
+	./core-tests.exe
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) core-tests.exe windows-tests.exe *.obj *.o
 
-.PHONY: all clean
+.PHONY: all test clean
