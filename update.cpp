@@ -612,6 +612,7 @@ public:
                     dataBytesLeft_ -= toConsume;
                 }
                 if (dataBytesLeft_ == 0) {
+                    flushRemaining(onFileData);
                     completeEntry(onFileEnd);
                 }
             }
@@ -678,6 +679,29 @@ private:
                 if (res == MZ_STREAM_END) break;
                 require(res == MZ_OK || res == MZ_BUF_ERROR, "Inflate decompression error");
             }
+        }
+    }
+
+    template<class OnFileData>
+    void flushRemaining(OnFileData onFileData) {
+        const auto& entry = plan_.entries[currentEntryIdx_];
+        if (entry.isDirectory || entry.method != 8 || !inflaterActive_) return;
+
+        std::uint8_t outBuf[32768];
+        while (true) {
+            inflater_.next_out = outBuf;
+            inflater_.avail_out = sizeof(outBuf);
+            const int res = mz_inflate(&inflater_, MZ_FINISH);
+            const std::size_t produced = sizeof(outBuf) - inflater_.avail_out;
+            if (produced > 0) {
+                onFileData(outBuf, produced);
+                currCrc_ = mz_crc32(currCrc_, outBuf, produced);
+                currUncompBytes_ += produced;
+                require(currUncompBytes_ <= entry.uncompSize, "Decompressed size exceeded expected entry size");
+            }
+            if (res == MZ_STREAM_END) break;
+            require(res == MZ_BUF_ERROR && produced == 0, "Inflate finish error");
+            if (produced == 0) break;
         }
     }
 
