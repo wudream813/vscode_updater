@@ -122,6 +122,28 @@ int main(int argc, char** argv) {
             check(contents(streamOut / "test1.txt").size() == 260, "stream test1 size");
             check(contents(streamOut / "sub/test2.txt") == "Decompression test!", "stream test2 content");
         }
+
+        // Test locateProductJson and versioned update layout (win32VersionedUpdate)
+        {
+            const auto versionedDir = work.root / "versioned-app";
+            fs::create_directories(versionedDir / "07f806f999/resources/app");
+            {
+                std::ofstream f(versionedDir / "07f806f999/resources/app/product.json");
+                f << "{\"version\":\"1.140.0\",\"commit\":\"07f806f999227108933c2e30515b26eecc1fda74\",\"quality\":\"stable\"}";
+            }
+            {
+                std::ofstream f(versionedDir / "07f806f999/resources/app/package.json");
+                f << "{\"version\":\"1.140.0\",\"name\":\"Code\"}";
+            }
+            // Copy executable from current test binary to act as Code.exe
+            fs::copy_file(executablePath(), versionedDir / "Code.exe");
+            check(looksLikeVSCode(versionedDir), "versioned VS Code directory recognized");
+            const auto id = localIdentity(versionedDir);
+            check(id.version == "1.140.0", "versioned identity version");
+            check(id.commit == "07f806f999227108933c2e30515b26eecc1fda74", "versioned identity commit");
+            check(id.quality == "stable", "versioned identity quality");
+            check(id.arch == "x64", "versioned identity arch");
+        }
 std::cout << "PASS: " << checks << " Windows integration checks\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << "FAIL after " << checks << " checks: " << e.what() << '\n'; return 1; }

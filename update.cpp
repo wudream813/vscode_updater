@@ -152,9 +152,25 @@ void writeJson(const fs::path& p, const json& j) {
     require(!f.fail(), "Cannot close metadata file");
 }
 
+fs::path locateProductJson(const fs::path& dir) {
+    const auto standard = dir / "resources/app/product.json";
+    if (fs::is_regular_file(standard)) return standard;
+    if (fs::is_directory(dir)) {
+        for (const auto& entry : fs::directory_iterator(dir)) {
+            if (entry.is_directory()) {
+                const auto candidate = entry.path() / "resources/app/product.json";
+                if (fs::is_regular_file(candidate)) return candidate;
+            }
+        }
+    }
+    return {};
+}
+
 bool looksLikeVSCode(const fs::path& p) {
-    return fs::is_regular_file(p / "resources/app/product.json") &&
-           fs::is_regular_file(p / "resources/app/package.json") &&
+    const auto product = locateProductJson(p);
+    if (product.empty()) return false;
+    const auto appDir = product.parent_path();
+    return fs::is_regular_file(appDir / "package.json") &&
            (fs::is_regular_file(p / "Code.exe") || fs::is_regular_file(p / "Code - Insiders.exe"));
 }
 
@@ -226,8 +242,11 @@ std::string executableArch(const fs::path& exe) {
 
 updater::Identity localIdentity(const fs::path& dir) {
     try {
-        const auto product = readJson(dir / "resources/app/product.json");
-        const auto package = readJson(dir / "resources/app/package.json");
+        const auto productPath = locateProductJson(dir);
+        if (productPath.empty()) return {};
+        const auto appDir = productPath.parent_path();
+        const auto product = readJson(productPath);
+        const auto package = readJson(appDir / "package.json");
         updater::Identity id;
         id.version = package.value("version", product.value("version", ""));
         id.commit = product.value("commit", "");
