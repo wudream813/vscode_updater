@@ -13,6 +13,8 @@ cases = [
     (["--threads", "17"], 2),
     (["--arch", "x86"], 2),
     (["--dir", "--force"], 2),
+        (["--stream", "--help"], 0),
+    (["--no-stream", "--help"], 0),
     (["--check", "--dir", "."], 1),  # refused before querying the network
 ]
 for args, expected in cases:

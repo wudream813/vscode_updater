@@ -79,7 +79,50 @@ int main(int argc, char** argv) {
         std::atomic<bool> cancel{false};
         ExtractOutput sink{std::ofstream(work.root / "callback.txt", std::ios::binary), 0, 2, false, &cancel};
         check(extractWrite(&sink, 0, "abc", 3) == 0 && sink.failed, "ZIP entry write crossed size boundary");
-        std::cout << "PASS: " << checks << " Windows integration checks\n";
+
+        // Test streaming unpacking in Windows tests using offline fixture stream.zip
+        {
+            std::ifstream fstream(fixtures / "stream.zip", std::ios::binary);
+            check(fstream.good(), "stream.zip fixture missing");
+            std::vector<std::uint8_t> data((std::istreambuf_iterator<char>(fstream)), std::istreambuf_iterator<char>());
+            auto eocd = updater::findEocd(data.data(), data.size(), data.size());
+            const auto streamPlan = updater::parseCentralDirectory(data.data() + eocd.cdOffset, eocd.cdSize, eocd.totalEntries, data.size());
+            check(streamPlan.isSequential, "streamPlan sequential");
+            const auto streamOut = work.root / "stream-staged";
+            fs::create_directories(streamOut);
+
+            ZipStreamUnpacker unpacker(streamPlan);
+            std::ofstream currentOut;
+            fs::path curPath;
+
+            auto onDir = [&](const std::string& d) {
+                fs::create_directories(streamOut / fs::path(wide(d)));
+            };
+            auto onStart = [&](const updater::PlannedEntry& e) {
+                curPath = streamOut / fs::path(wide(e.safePath));
+                fs::create_directories(curPath.parent_path());
+                currentOut.open(curPath, std::ios::binary | std::ios::trunc);
+                check(currentOut.good(), "stream test file open");
+            };
+            auto onData = [&](const std::uint8_t* p, std::size_t n) {
+                currentOut.write(reinterpret_cast<const char*>(p), n);
+                check(currentOut.good(), "stream test file write");
+            };
+            auto onEnd = [&](const updater::PlannedEntry&) {
+                if (currentOut.is_open()) finishFile(currentOut);
+            };
+
+            std::size_t pos = 0;
+            while (pos < eocd.cdOffset) {
+                std::size_t chunk = std::min<std::size_t>(11, eocd.cdOffset - pos);
+                unpacker.feed(pos, data.data() + pos, chunk, onDir, onStart, onData, onEnd);
+                pos += chunk;
+            }
+            check(unpacker.isComplete(), "stream unpack complete in Windows integration");
+            check(contents(streamOut / "test1.txt").size() == 260, "stream test1 size");
+            check(contents(streamOut / "sub/test2.txt") == "Decompression test!", "stream test2 content");
+        }
+std::cout << "PASS: " << checks << " Windows integration checks\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << "FAIL after " << checks << " checks: " << e.what() << '\n'; return 1; }
 }

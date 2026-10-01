@@ -1,3 +1,4 @@
+#include <cstring>
 #pragma once
 
 // Platform-independent validation shared by the Windows updater and regression tests.
@@ -49,6 +50,7 @@ struct Options {
     bool force = false;
     bool check = false;
     bool keepZip = false;
+    bool stream = true; // stream download and decompress on the fly by default
     bool pause = false; // scripts never block by default
     bool help = false;
 };
@@ -73,6 +75,8 @@ inline Options parseOptions(const std::vector<std::string>& args, const std::str
         } else if (a == "--force") o.force = true;
         else if (a == "--check") o.check = true;
         else if (a == "--keep-zip") o.keepZip = true;
+        else if (a == "--stream") o.stream = true;
+        else if (a == "--no-stream") o.stream = false;
         else if (a == "--pause") o.pause = true;
         else if (a == "--no-pause") o.pause = false;
         else if (a == "--help" || a == "-h") o.help = true;
@@ -222,4 +226,178 @@ void activate(bool hasOld, Rename rename) {
         throw;
     }
 }
+
+// ZIP Central Directory structures and streaming pre-validation
+struct EocdInfo {
+    std::uint16_t diskNumber = 0;
+    std::uint16_t cdStartDisk = 0;
+    std::uint16_t recordsOnDisk = 0;
+    std::uint16_t totalEntries = 0;
+    std::uint32_t cdSize = 0;
+    std::uint32_t cdOffset = 0;
+    std::uint16_t commentLength = 0;
+};
+
+inline std::uint16_t readU16(const std::uint8_t* p) {
+    return static_cast<std::uint16_t>(p[0] | (static_cast<std::uint16_t>(p[1]) << 8));
+}
+
+inline std::uint32_t readU32(const std::uint8_t* p) {
+    return static_cast<std::uint32_t>(p[0] |
+           (static_cast<std::uint32_t>(p[1]) << 8) |
+           (static_cast<std::uint32_t>(p[2]) << 16) |
+           (static_cast<std::uint32_t>(p[3]) << 24));
+}
+
+inline EocdInfo findEocd(const std::uint8_t* buffer, std::size_t bufferSize, std::uint64_t archiveTotalSize) {
+    require(buffer != nullptr && bufferSize >= 22, "Tail buffer too small for ZIP EOCD");
+    const std::uint32_t sig = 0x06054b50;
+    const std::size_t maxComment = std::min<std::size_t>(65535, bufferSize - 22);
+    const std::size_t searchStart = bufferSize - 22;
+    const std::size_t searchEnd = bufferSize - 22 - maxComment;
+
+    std::size_t pos = searchStart;
+    bool found = false;
+    while (true) {
+        if (readU32(buffer + pos) == sig) {
+            found = true;
+            break;
+        }
+        if (pos == searchEnd) break;
+        --pos;
+    }
+    require(found, "ZIP End of Central Directory (EOCD) signature not found");
+
+    EocdInfo info{};
+    info.diskNumber = readU16(buffer + pos + 4);
+    info.cdStartDisk = readU16(buffer + pos + 6);
+    info.recordsOnDisk = readU16(buffer + pos + 8);
+    info.totalEntries = readU16(buffer + pos + 10);
+    info.cdSize = readU32(buffer + pos + 12);
+    info.cdOffset = readU32(buffer + pos + 16);
+    info.commentLength = readU16(buffer + pos + 20);
+
+    require(info.diskNumber == 0 && info.cdStartDisk == 0, "Multi-disk ZIP archives are not supported");
+    require(info.recordsOnDisk == info.totalEntries, "Inconsistent ZIP directory record counts");
+    require(info.totalEntries > 0 && info.totalEntries <= maxEntries, "Invalid ZIP entry count in EOCD");
+    require(pos + 22 + info.commentLength <= bufferSize, "ZIP EOCD comment length overflow");
+    require(static_cast<std::uint64_t>(info.cdOffset) + info.cdSize <= archiveTotalSize,
+            "ZIP Central Directory extends beyond archive bounds");
+    return info;
+}
+
+struct PlannedEntry {
+    std::size_t index = 0;
+    std::string safePath;
+    std::uint16_t method = 0;
+    std::uint16_t flags = 0;
+    std::uint32_t crc32 = 0;
+    std::uint32_t compSize = 0;
+    std::uint32_t uncompSize = 0;
+    std::uint32_t localOffset = 0;
+    std::uint32_t externalAttr = 0;
+    bool isDirectory = false;
+};
+
+struct ZipStreamPlan {
+    std::vector<PlannedEntry> entries;
+    std::uint64_t expanded = 0;
+    bool isSequential = true;
+};
+
+inline ZipStreamPlan parseCentralDirectory(const std::uint8_t* cdBuffer, std::size_t cdSize,
+                                          std::uint16_t expectedEntries, std::uint64_t archiveTotalSize) {
+    require(cdBuffer != nullptr && cdSize >= 46, "Central Directory buffer too small");
+    ZipStreamPlan plan;
+    plan.entries.reserve(expectedEntries);
+
+    std::size_t pos = 0;
+    std::uint32_t lastOffset = 0;
+    bool hasLastOffset = false;
+
+    std::vector<std::pair<std::string, bool>> registeredNames;
+    registeredNames.reserve(expectedEntries);
+
+    for (std::size_t i = 0; i < expectedEntries; ++i) {
+        require(pos + 46 <= cdSize, "Truncated Central Directory entry");
+        require(readU32(cdBuffer + pos) == 0x02014b50, "Invalid Central Directory entry signature");
+
+        const std::uint16_t flags = readU16(cdBuffer + pos + 8);
+        const std::uint16_t method = readU16(cdBuffer + pos + 10);
+        const std::uint32_t crc32 = readU32(cdBuffer + pos + 16);
+        const std::uint32_t compSize = readU32(cdBuffer + pos + 20);
+        const std::uint32_t uncompSize = readU32(cdBuffer + pos + 24);
+        const std::uint16_t fnameLen = readU16(cdBuffer + pos + 28);
+        const std::uint16_t extraLen = readU16(cdBuffer + pos + 30);
+        const std::uint16_t commentLen = readU16(cdBuffer + pos + 32);
+        const std::uint32_t extAttr = readU32(cdBuffer + pos + 38);
+        const std::uint32_t localOffset = readU32(cdBuffer + pos + 42);
+
+        require((flags & 1) == 0, "Encrypted ZIP entry");
+        require(method == 0 || method == 8, "Unsupported compression method (only Store and Deflate supported)");
+        if (method == 0) {
+            require(compSize == uncompSize, "Stored ZIP entry compressed size mismatch");
+        }
+
+        require(pos + 46 + fnameLen + extraLen + commentLen <= cdSize, "Central Directory entry data overflow");
+        std::string rawName(reinterpret_cast<const char*>(cdBuffer + pos + 46), fnameLen);
+        const bool isDir = (!rawName.empty() && (rawName.back() == '/' || rawName.back() == '\\')) ||
+                           ((extAttr & 0x10) != 0);
+
+        const auto safe = safeArchivePath(rawName);
+        validateZipAttributes(extAttr, isDir);
+
+        require(uncompSize <= maxEntryBytes && uncompSize <= maxExpandedBytes - plan.expanded,
+                "ZIP expanded size limit exceeded");
+        plan.expanded += uncompSize;
+
+        require(static_cast<std::uint64_t>(localOffset) + 30 <= archiveTotalSize,
+                "Local file header extends beyond archive bounds");
+
+        if (hasLastOffset && localOffset <= lastOffset) {
+            plan.isSequential = false;
+        }
+        lastOffset = localOffset;
+        hasLastOffset = true;
+
+        const auto lowerName = asciiLower(safe);
+        for (const auto& existing : registeredNames) {
+            require(existing.first != lowerName, "Duplicate/case-colliding ZIP entry: " + safe);
+        }
+        registeredNames.emplace_back(lowerName, isDir);
+
+        PlannedEntry pe{};
+        pe.index = i;
+        pe.safePath = safe;
+        pe.method = method;
+        pe.flags = flags;
+        pe.crc32 = crc32;
+        pe.compSize = compSize;
+        pe.uncompSize = uncompSize;
+        pe.localOffset = localOffset;
+        pe.externalAttr = extAttr;
+        pe.isDirectory = isDir;
+
+        plan.entries.push_back(std::move(pe));
+        pos += 46 + fnameLen + extraLen + commentLen;
+    }
+
+    for (const auto& item : registeredNames) {
+        std::string path = item.first;
+        std::size_t slash = path.rfind('/');
+        while (slash != std::string::npos) {
+            std::string parent = path.substr(0, slash);
+            for (const auto& other : registeredNames) {
+                if (other.first == parent) {
+                    require(other.second, "ZIP file and directory collision: " + parent);
+                }
+            }
+            slash = parent.rfind('/');
+        }
+    }
+    return plan;
+}
+
+
+
 } // namespace updater

@@ -1,3 +1,5 @@
+#include <map>
+#include <fstream>
 #include "../updater_core.hpp"
 #include <cstring>
 #include <iostream>
@@ -26,6 +28,8 @@ int main() {
         check(parseOptions({}, "arm64").arch == "arm64", "native arm64");
         check(!parseOptions({}).pause, "must not pause by default");
         check(parseOptions({"--threads", "16", "--check", "--quality", "insider"}).threads == 16, "CLI options");
+        check(parseOptions({}).stream, "must stream by default");
+        check(!parseOptions({"--no-stream"}).stream, "explicit no-stream");
         check(!parseOptions({"--pause", "--no-pause"}).pause, "explicit no-pause");
         for (const auto* arg : {"0", "17", "-1", "abc", "8x", "99999999999999999999"})
             rejects([&] { parseOptions({"--threads", arg}); }, "bad thread count accepted");
@@ -123,7 +127,92 @@ int main() {
         int moves = 0;
         activate(false, [&](const char* from, const char* to) { ++moves; check(std::string(from) == "staged" && std::string(to) == "target", "fresh install transition"); });
         check(moves == 1, "fresh install moved nonexistent old install");
-        std::cout << "PASS: " << checks << " core checks\n";
+
+        // Central Directory and EOCD parsing tests
+        {
+            std::ifstream f("/tmp/sample.zip", std::ios::binary);
+            std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            auto eocd = findEocd(data.data(), data.size(), data.size());
+            check(eocd.totalEntries == 3, "sample EOCD entries");
+            check(eocd.cdSize == 170, "sample EOCD CD size");
+            auto plan = parseCentralDirectory(data.data() + eocd.cdOffset, eocd.cdSize, eocd.totalEntries, data.size());
+            check(plan.entries.size() == 3, "sample CD entries count");
+            check(plan.isSequential, "sample CD sequential layout");
+            check(plan.expanded == 279, "sample CD expanded bytes");
+            check(plan.entries[0].safePath == "test1.txt", "sample entry 0 path");
+            check(plan.entries[1].safePath == "sub/test2.txt", "sample entry 1 path");
+            check(plan.entries[2].safePath == "sub/empty", "sample entry 2 path");
+            check(plan.entries[2].isDirectory, "sample entry 2 is directory");
+
+            // Rejections on corrupt EOCD
+            rejects([&] { findEocd(data.data(), 10, data.size()); }, "truncated tail accepted");
+            std::vector<uint8_t> badEocd = data;
+            for (size_t i = data.size() - 22; i < data.size(); ++i) badEocd[i] = 0;
+            rejects([&] { findEocd(badEocd.data(), badEocd.size(), badEocd.size()); }, "missing EOCD accepted");
+
+            // Out of bounds CD offset
+            std::vector<uint8_t> oobData = data;
+            size_t eocdPos = data.size() - 22;
+            oobData[eocdPos + 16] = 0xff;
+            oobData[eocdPos + 17] = 0xff;
+            rejects([&] { findEocd(oobData.data(), oobData.size(), data.size()); }, "out of bounds CD accepted");
+        }
+
+        // Central Directory and EOCD parsing tests (embedded standalone ZIP buffer)
+        {
+            static const std::uint8_t sampleZip[] = {
+                0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x08, 0x00, 0x40, 0x2d, 0x41, 0x5d, 0x92, 0x0e,
+                0x53, 0x62, 0x12, 0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x74, 0x65,
+                0x73, 0x74, 0x31, 0x2e, 0x74, 0x78, 0x74, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x08, 0xcf, 0x2f,
+                0xca, 0x49, 0x51, 0x54, 0xf0, 0x18, 0x99, 0x1c, 0x00, 0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00,
+                0x00, 0x08, 0x00, 0x40, 0x2d, 0x41, 0x5d, 0xcc, 0xb7, 0x3c, 0xda, 0x15, 0x00, 0x00, 0x00, 0x13,
+                0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x73, 0x75, 0x62, 0x2f, 0x74, 0x65, 0x73, 0x74, 0x32,
+                0x2e, 0x74, 0x78, 0x74, 0x73, 0x49, 0x4d, 0xce, 0xcf, 0x2d, 0x28, 0x4a, 0x2d, 0x2e, 0xce, 0xcc,
+                0xcf, 0x53, 0x28, 0x49, 0x2d, 0x2e, 0x51, 0x04, 0x00, 0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00,
+                0x00, 0x08, 0x00, 0x40, 0x2d, 0x41, 0x5d, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x73, 0x75, 0x62, 0x2f, 0x65, 0x6d, 0x70, 0x74, 0x79,
+                0x2f, 0x03, 0x00, 0x50, 0x4b, 0x01, 0x02, 0x14, 0x03, 0x14, 0x00, 0x00, 0x00, 0x08, 0x00, 0x40,
+                0x2d, 0x41, 0x5d, 0x92, 0x0e, 0x53, 0x62, 0x12, 0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x09,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x00, 0x00, 0x00,
+                0x00, 0x74, 0x65, 0x73, 0x74, 0x31, 0x2e, 0x74, 0x78, 0x74, 0x50, 0x4b, 0x01, 0x02, 0x14, 0x03,
+                0x14, 0x00, 0x00, 0x00, 0x08, 0x00, 0x40, 0x2d, 0x41, 0x5d, 0xcc, 0xb7, 0x3c, 0xda, 0x15, 0x00,
+                0x00, 0x00, 0x13, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x80, 0x01, 0x39, 0x00, 0x00, 0x00, 0x73, 0x75, 0x62, 0x2f, 0x74, 0x65, 0x73, 0x74,
+                0x32, 0x2e, 0x74, 0x78, 0x74, 0x50, 0x4b, 0x01, 0x02, 0x14, 0x03, 0x14, 0x00, 0x00, 0x00, 0x08,
+                0x00, 0x40, 0x2d, 0x41, 0x5d, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0xfd, 0x41, 0x79,
+                0x00, 0x00, 0x00, 0x73, 0x75, 0x62, 0x2f, 0x65, 0x6d, 0x70, 0x74, 0x79, 0x2f, 0x50, 0x4b, 0x05,
+                0x06, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x03, 0x00, 0xaa, 0x00, 0x00, 0x00, 0xa3, 0x00, 0x00,
+                0x00, 0x00, 0x00
+            };
+            const std::size_t zipSize = sizeof(sampleZip);
+            auto eocd = findEocd(sampleZip, zipSize, zipSize);
+            check(eocd.totalEntries == 3, "sample EOCD entries");
+            check(eocd.cdSize == 170, "sample EOCD CD size");
+            check(eocd.cdOffset == 163, "sample EOCD CD offset");
+            auto plan = parseCentralDirectory(sampleZip + eocd.cdOffset, eocd.cdSize, eocd.totalEntries, zipSize);
+            check(plan.entries.size() == 3, "sample CD entries count");
+            check(plan.isSequential, "sample CD sequential layout");
+            check(plan.expanded == 279, "sample CD expanded bytes");
+            check(plan.entries[0].safePath == "test1.txt", "sample entry 0 path");
+            check(plan.entries[1].safePath == "sub/test2.txt", "sample entry 1 path");
+            check(plan.entries[2].safePath == "sub/empty", "sample entry 2 path");
+            check(plan.entries[2].isDirectory, "sample entry 2 is directory");
+
+            // Rejections on corrupt EOCD
+            rejects([&] { findEocd(sampleZip, 10, zipSize); }, "truncated tail accepted");
+            std::vector<std::uint8_t> badEocd(sampleZip, sampleZip + zipSize);
+            for (std::size_t i = zipSize - 22; i < zipSize; ++i) badEocd[i] = 0;
+            rejects([&] { findEocd(badEocd.data(), badEocd.size(), badEocd.size()); }, "missing EOCD accepted");
+
+            // Out of bounds CD offset
+            std::vector<std::uint8_t> oobData(sampleZip, sampleZip + zipSize);
+            const std::size_t eocdPos = zipSize - 22;
+            oobData[eocdPos + 16] = 0xff;
+            oobData[eocdPos + 17] = 0xff;
+            rejects([&] { findEocd(oobData.data(), oobData.size(), zipSize); }, "out of bounds CD accepted");
+        }
+std::cout << "PASS: " << checks << " core checks\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << "FAIL after " << checks << " checks: " << e.what() << '\n'; return 1; }
 }

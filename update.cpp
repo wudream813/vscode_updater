@@ -330,35 +330,60 @@ Remote fetchRemote(const updater::Options& options) {
     return r;
 }
 
-struct Hash {
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    std::vector<UCHAR> object;
-    ~Hash() {
-        if (hash) BCryptDestroyHash(hash);
-        if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+class Sha256Hasher {
+    BCRYPT_ALG_HANDLE algorithm_ = nullptr;
+    BCRYPT_HASH_HANDLE hash_ = nullptr;
+    std::vector<UCHAR> object_;
+    bool finalized_ = false;
+
+public:
+    Sha256Hasher() {
+        require(BCryptOpenAlgorithmProvider(&algorithm_, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0,
+                "Cannot initialize SHA-256");
+        DWORD size = 0, returned = 0;
+        require(BCryptGetProperty(algorithm_, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&size), sizeof(size), &returned, 0) >= 0,
+                "Cannot query SHA-256 state size");
+        object_.resize(size);
+        require(BCryptCreateHash(algorithm_, &hash_, object_.data(), size, nullptr, 0, 0) >= 0,
+                "Cannot create SHA-256 state");
+    }
+
+    ~Sha256Hasher() {
+        if (hash_) BCryptDestroyHash(hash_);
+        if (algorithm_) BCryptCloseAlgorithmProvider(algorithm_, 0);
+    }
+
+    Sha256Hasher(const Sha256Hasher&) = delete;
+    Sha256Hasher& operator=(const Sha256Hasher&) = delete;
+
+    void update(const void* data, std::size_t len) {
+        require(!finalized_, "Hash already finalized");
+        if (len == 0) return;
+        require(BCryptHashData(hash_, reinterpret_cast<PUCHAR>(const_cast<void*>(data)), static_cast<ULONG>(len), 0) >= 0,
+                "SHA-256 update failed");
+    }
+
+    std::string finish() {
+        require(!finalized_, "Hash already finalized");
+        finalized_ = true;
+        std::array<UCHAR, 32> digest{};
+        require(BCryptFinishHash(hash_, digest.data(), static_cast<ULONG>(digest.size()), 0) >= 0,
+                "SHA-256 finalization failed");
+        std::ostringstream text;
+        for (auto b : digest) text << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(b);
+        return text.str();
     }
 };
 
 std::string sha256(const fs::path& file) {
-    Hash h;
-    require(BCryptOpenAlgorithmProvider(&h.algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0, "Cannot initialize SHA-256");
-    DWORD size = 0, returned = 0;
-    require(BCryptGetProperty(h.algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&size), sizeof(size), &returned, 0) >= 0,
-            "Cannot query SHA-256 state size");
-    h.object.resize(size);
-    require(BCryptCreateHash(h.algorithm, &h.hash, h.object.data(), size, nullptr, 0, 0) >= 0, "Cannot create SHA-256 state");
+    Sha256Hasher hasher;
     std::ifstream f(file, std::ios::binary);
     require(f.good(), "Cannot read downloaded archive");
     std::array<char, 128 * 1024> data{};
     while (f.read(data.data(), data.size()) || f.gcount())
-        require(BCryptHashData(h.hash, reinterpret_cast<PUCHAR>(data.data()), static_cast<ULONG>(f.gcount()), 0) >= 0, "SHA-256 update failed");
+        hasher.update(data.data(), static_cast<std::size_t>(f.gcount()));
     require(f.eof() && !f.bad(), "Archive read failed during SHA-256 verification");
-    std::array<UCHAR, 32> digest{};
-    require(BCryptFinishHash(h.hash, digest.data(), static_cast<ULONG>(digest.size()), 0) >= 0, "SHA-256 finalization failed");
-    std::ostringstream text;
-    for (auto b : digest) text << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(b);
-    return text.str();
+    return hasher.finish();
 }
 
 struct Progress {
@@ -504,6 +529,334 @@ void download(const Remote& remote, const fs::path& file, int threads) {
             std::this_thread::sleep_for(1s);
         }
     }
+}
+
+
+class ZipStreamUnpacker {
+public:
+    enum State {
+        STATE_HEADER,
+        STATE_DATA,
+        STATE_DONE
+    };
+
+    explicit ZipStreamUnpacker(const updater::ZipStreamPlan& plan) : plan_(plan) {
+        initCurrentEntry();
+    }
+
+    ~ZipStreamUnpacker() {
+        if (inflaterActive_) {
+            mz_inflateEnd(&inflater_);
+        }
+    }
+
+    // Callbacks:
+    // onDir: void(const std::string& safePath)
+    // onFileStart: void(const updater::PlannedEntry& entry)
+    // onFileData: void(const uint8_t* chunk, std::size_t len)
+    // onFileEnd: void(const updater::PlannedEntry& entry)
+    template<class OnDir, class OnFileStart, class OnFileData, class OnFileEnd>
+    void feed(std::uint64_t streamOffset, const std::uint8_t* data, std::size_t size,
+              OnDir onDir, OnFileStart onFileStart, OnFileData onFileData, OnFileEnd onFileEnd) {
+        std::size_t processed = 0;
+        while (processed < size && currentEntryIdx_ < plan_.entries.size()) {
+            const std::uint64_t byteOffset = streamOffset + processed;
+            const auto& entry = plan_.entries[currentEntryIdx_];
+
+            if (state_ == STATE_HEADER) {
+                if (byteOffset < entry.localOffset) {
+                    const std::size_t skip = std::min<std::size_t>(size - processed, static_cast<std::size_t>(entry.localOffset - byteOffset));
+                    processed += skip;
+                    continue;
+                }
+
+                const std::size_t needHeader = localHeaderBuf_.size();
+                if (needHeader < 30) {
+                    const std::size_t toCopy = std::min<std::size_t>(size - processed, 30 - needHeader);
+                    localHeaderBuf_.insert(localHeaderBuf_.end(), data + processed, data + processed + toCopy);
+                    processed += toCopy;
+                    if (localHeaderBuf_.size() < 30) continue;
+
+                    const std::uint32_t sig = updater::readU32(localHeaderBuf_.data());
+                    require(sig == 0x04034b50, "Invalid local header signature");
+                    const std::uint16_t flen = updater::readU16(localHeaderBuf_.data() + 26);
+                    const std::uint16_t elen = updater::readU16(localHeaderBuf_.data() + 28);
+                    localHeaderTargetLen_ = 30 + flen + elen;
+                }
+
+                if (localHeaderBuf_.size() < localHeaderTargetLen_) {
+                    const std::size_t toCopy = std::min<std::size_t>(size - processed, localHeaderTargetLen_ - localHeaderBuf_.size());
+                    localHeaderBuf_.insert(localHeaderBuf_.end(), data + processed, data + processed + toCopy);
+                    processed += toCopy;
+                    if (localHeaderBuf_.size() < localHeaderTargetLen_) continue;
+                }
+
+                // Header is fully received
+                state_ = STATE_DATA;
+                dataBytesLeft_ = entry.compSize;
+
+                if (entry.isDirectory) {
+                    onDir(entry.safePath);
+                } else {
+                    onFileStart(entry);
+                }
+
+                if (entry.compSize == 0) {
+                    completeEntry(onFileEnd);
+                }
+            } else if (state_ == STATE_DATA) {
+                const std::size_t toConsume = std::min<std::size_t>(size - processed, dataBytesLeft_);
+                if (toConsume > 0) {
+                    consumeFileData(data + processed, toConsume, onFileData);
+                    processed += toConsume;
+                    dataBytesLeft_ -= toConsume;
+                }
+                if (dataBytesLeft_ == 0) {
+                    completeEntry(onFileEnd);
+                }
+            }
+        }
+    }
+
+    bool isComplete() const {
+        return currentEntryIdx_ >= plan_.entries.size();
+    }
+
+    std::size_t completedEntriesCount() const {
+        return currentEntryIdx_;
+    }
+
+private:
+    void initCurrentEntry() {
+        if (currentEntryIdx_ >= plan_.entries.size()) {
+            state_ = STATE_DONE;
+            return;
+        }
+        state_ = STATE_HEADER;
+        localHeaderBuf_.clear();
+        localHeaderTargetLen_ = 30;
+        dataBytesLeft_ = 0;
+        currUncompBytes_ = 0;
+        currCrc_ = 0;
+
+        const auto& entry = plan_.entries[currentEntryIdx_];
+        if (!entry.isDirectory && entry.method == 8) {
+            if (inflaterActive_) mz_inflateEnd(&inflater_);
+            std::memset(&inflater_, 0, sizeof(inflater_));
+            const int res = mz_inflateInit2(&inflater_, -MZ_DEFAULT_WINDOW_BITS);
+            require(res == MZ_OK, "Cannot initialize Deflate stream inflater");
+            inflaterActive_ = true;
+        }
+    }
+
+    template<class OnFileData>
+    void consumeFileData(const std::uint8_t* chunk, std::size_t len, OnFileData onFileData) {
+        const auto& entry = plan_.entries[currentEntryIdx_];
+        if (entry.isDirectory) return;
+
+        if (entry.method == 0) { // Store
+            onFileData(chunk, len);
+            currCrc_ = mz_crc32(currCrc_, chunk, len);
+            currUncompBytes_ += len;
+            require(currUncompBytes_ <= entry.uncompSize, "Stored file size exceeded expected size");
+        } else if (entry.method == 8) { // Deflate
+            inflater_.next_in = chunk;
+            inflater_.avail_in = static_cast<mz_uint32>(len);
+
+            std::uint8_t outBuf[32768];
+            while (inflater_.avail_in > 0) {
+                inflater_.next_out = outBuf;
+                inflater_.avail_out = sizeof(outBuf);
+                const int res = mz_inflate(&inflater_, MZ_NO_FLUSH);
+                const std::size_t produced = sizeof(outBuf) - inflater_.avail_out;
+                if (produced > 0) {
+                    onFileData(outBuf, produced);
+                    currCrc_ = mz_crc32(currCrc_, outBuf, produced);
+                    currUncompBytes_ += produced;
+                    require(currUncompBytes_ <= entry.uncompSize, "Decompressed size exceeded expected entry size");
+                }
+                if (res == MZ_STREAM_END) break;
+                require(res == MZ_OK || res == MZ_BUF_ERROR, "Inflate decompression error");
+            }
+        }
+    }
+
+    template<class OnFileEnd>
+    void completeEntry(OnFileEnd onFileEnd) {
+        const auto& entry = plan_.entries[currentEntryIdx_];
+        if (!entry.isDirectory) {
+            if (entry.method == 8 && inflaterActive_) {
+                mz_inflateEnd(&inflater_);
+                inflaterActive_ = false;
+            }
+            require(currUncompBytes_ == entry.uncompSize, "Uncompressed size mismatch for " + entry.safePath);
+            require(currCrc_ == entry.crc32, "CRC-32 checksum mismatch for " + entry.safePath);
+            onFileEnd(entry);
+        }
+        ++currentEntryIdx_;
+        initCurrentEntry();
+    }
+
+    updater::ZipStreamPlan plan_;
+    std::size_t currentEntryIdx_ = 0;
+    State state_ = STATE_HEADER;
+
+    std::vector<std::uint8_t> localHeaderBuf_;
+    std::size_t localHeaderTargetLen_ = 30;
+    std::size_t dataBytesLeft_ = 0;
+
+    mz_stream inflater_{};
+    bool inflaterActive_ = false;
+    std::uint32_t currCrc_ = 0;
+    std::uint64_t currUncompBytes_ = 0;
+};
+
+struct RemoteProbe {
+    std::uint64_t totalSize = 0;
+    std::string etag;
+    bool supportsRange = false;
+};
+
+RemoteProbe probeRemote(const std::string& url) {
+    http::Request probe(url, L"Range: bytes=0-0\r\n");
+    RemoteProbe result{};
+    if (probe.status() == 200) {
+        result.supportsRange = false;
+        const auto len = probe.header(HTTP_QUERY_CONTENT_LENGTH);
+        result.totalSize = len.empty() ? 0 : updater::number(len);
+        return result;
+    }
+    require(probe.status() == 206, "Download probe returned HTTP " + std::to_string(probe.status()));
+    const auto range = updater::parseContentRange(probe.header(HTTP_QUERY_CONTENT_RANGE));
+    updater::validateRange(206, probe.header(HTTP_QUERY_CONTENT_RANGE), 0, 1, range.total);
+    result.totalSize = range.total;
+    result.supportsRange = true;
+    result.etag = probe.header(HTTP_QUERY_ETAG);
+    if (result.etag.rfind("W/", 0) == 0) result.etag.clear();
+    updater::copyResponse([&](char* p, std::size_t n) { return probe.read(p, n); }, [](const char*, std::size_t) {}, 1, 1);
+    return result;
+}
+
+updater::ZipStreamPlan fetchAndPlanCentralDirectory(const std::string& url, std::uint64_t totalSize, const std::string& etag) {
+    // 1. Fetch the last 65536 bytes (or entire file if smaller)
+    const std::uint64_t tailFetch = std::min<std::uint64_t>(65536, totalSize);
+    const std::uint64_t tailStart = totalSize - tailFetch;
+    std::vector<std::uint8_t> tailBuf;
+    tailBuf.reserve(tailFetch);
+
+    auto tailHeaders = L"Range: bytes=" + std::to_wstring(tailStart) + L"-" + std::to_wstring(totalSize - 1) + L"\r\n";
+    if (!etag.empty()) tailHeaders += L"If-Match: " + wide(etag) + L"\r\n";
+
+    http::Request tailReq(url, tailHeaders);
+    updater::validateRange(tailReq.status(), tailReq.header(HTTP_QUERY_CONTENT_RANGE), tailStart, tailFetch, totalSize);
+    updater::copyResponse([&](char* p, std::size_t n) { return tailReq.read(p, n); },
+                          [&](const char* p, std::size_t n) {
+                              tailBuf.insert(tailBuf.end(), reinterpret_cast<const std::uint8_t*>(p),
+                                                            reinterpret_cast<const std::uint8_t*>(p) + n);
+                          }, tailFetch, tailFetch);
+
+    const auto eocd = updater::findEocd(tailBuf.data(), tailBuf.size(), totalSize);
+
+    // 2. Fetch Central Directory
+    std::vector<std::uint8_t> cdBuf;
+    cdBuf.reserve(eocd.cdSize);
+
+    auto cdHeaders = L"Range: bytes=" + std::to_wstring(eocd.cdOffset) + L"-" + std::to_wstring(static_cast<std::uint64_t>(eocd.cdOffset) + eocd.cdSize - 1) + L"\r\n";
+    if (!etag.empty()) cdHeaders += L"If-Match: " + wide(etag) + L"\r\n";
+
+    http::Request cdReq(url, cdHeaders);
+    updater::validateRange(cdReq.status(), cdReq.header(HTTP_QUERY_CONTENT_RANGE), eocd.cdOffset, eocd.cdSize, totalSize);
+    updater::copyResponse([&](char* p, std::size_t n) { return cdReq.read(p, n); },
+                          [&](const char* p, std::size_t n) {
+                              cdBuf.insert(cdBuf.end(), reinterpret_cast<const std::uint8_t*>(p),
+                                                          reinterpret_cast<const std::uint8_t*>(p) + n);
+                          }, eocd.cdSize, eocd.cdSize);
+
+    return updater::parseCentralDirectory(cdBuf.data(), cdBuf.size(), eocd.totalEntries, totalSize);
+}
+
+// Stream download while inflating and hashing in one pass
+void streamDownloadAndExtract(const Remote& remote, const fs::path& staged,
+                             const updater::ZipStreamPlan& plan, std::uint64_t totalSize, const std::string& etag) {
+    ZipStreamUnpacker unpacker(plan);
+    Sha256Hasher hasher;
+
+    std::ofstream currentFile;
+    fs::path currentFilePath;
+    std::size_t extractedCount = 0;
+
+    const auto started = std::chrono::steady_clock::now();
+    std::uint64_t bytesReceived = 0;
+
+    auto onDir = [&](const std::string& safePath) {
+        const auto dirPath = staged / fs::path(wide(safePath));
+        require(pathWithin(dirPath, staged), "ZIP output escaped staging directory");
+        fs::create_directories(dirPath);
+    };
+
+    auto onFileStart = [&](const updater::PlannedEntry& entry) {
+        const auto filePath = staged / fs::path(wide(entry.safePath));
+        require(pathWithin(filePath, staged), "ZIP output escaped staging directory");
+        safeAncestors(filePath.parent_path());
+        rejectReparse(filePath);
+        fs::create_directories(filePath.parent_path());
+        currentFile.open(filePath, std::ios::binary | std::ios::trunc);
+        require(currentFile.good(), "Cannot create extracted file: " + pathText(filePath));
+        currentFilePath = filePath;
+    };
+
+    auto onFileData = [&](const std::uint8_t* chunk, std::size_t len) {
+        currentFile.write(reinterpret_cast<const char*>(chunk), static_cast<std::streamsize>(len));
+        require(currentFile.good(), "Write failed for " + pathText(currentFilePath));
+    };
+
+    auto onFileEnd = [&](const updater::PlannedEntry&) {
+        if (currentFile.is_open()) {
+            finishFile(currentFile);
+            ++extractedCount;
+        }
+    };
+
+    // Download sequential stream
+    auto headers = L"Range: bytes=0-" + std::to_wstring(totalSize - 1) + L"\r\n";
+    if (!etag.empty()) headers += L"If-Match: " + wide(etag) + L"\r\n";
+
+    http::Request req(remote.url, headers);
+    updater::validateRange(req.status(), req.header(HTTP_QUERY_CONTENT_RANGE), 0, totalSize, totalSize);
+
+    std::vector<std::uint8_t> buffer(64 * 1024);
+    while (bytesReceived < totalSize) {
+        const std::size_t toRead = std::min<std::size_t>(buffer.size(), static_cast<std::size_t>(totalSize - bytesReceived));
+        const std::size_t n = req.read(reinterpret_cast<char*>(buffer.data()), toRead);
+        require(n > 0, "Unexpected early EOF during streaming download");
+
+        hasher.update(buffer.data(), n);
+        unpacker.feed(bytesReceived, buffer.data(), n, onDir, onFileStart, onFileData, onFileEnd);
+        bytesReceived += n;
+
+        if (interactiveOutput) {
+            const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            const double rate = elapsed > 0.01 ? bytesReceived / elapsed : 0;
+            std::ostringstream line;
+            line << "\r边下边解: " << (totalSize ? std::min<std::uint64_t>(100, bytesReceived * 100 / totalSize) : 0)
+                 << "%  " << std::fixed << std::setprecision(1)
+                 << bytesReceived / 1048576.0 << "/" << totalSize / 1048576.0 << " MiB  "
+                 << rate / 1048576.0 << " MiB/s  [" << extractedCount << "/" << plan.entries.size() << " files]";
+            if (rate > 0 && bytesReceived < totalSize) {
+                line << "  ETA " << static_cast<unsigned long long>((totalSize - bytesReceived) / rate) << "s";
+            }
+            std::cout << line.str() << "                    " << std::flush;
+        }
+    }
+
+    if (interactiveOutput) {
+        std::cout << "\r边下边解: 完成 (已提取 " << extractedCount << " 个文件)                                              \n";
+    }
+
+    require(unpacker.isComplete(), "Incomplete archive decompression");
+    std::cout << "校验 SHA-256...\n";
+    const std::string computedSha = hasher.finish();
+    require(computedSha == remote.sha256, "SHA-256 mismatch; stream integrity verification failed");
 }
 
 struct Zip {
@@ -693,15 +1046,48 @@ int run(const updater::Options& options) {
     fs::create_directory(staged);
     const int automatic = static_cast<int>(std::min(8u, std::max(1u, std::thread::hardware_concurrency())));
     const int threads = options.threads ? options.threads : automatic;
-    std::cout << "下载并验证安装包...\n";
-    download(remote, zip, threads);
-    const auto plan = inspectZip(zip);
     const auto portableBytes = dataSize(target / "data");
-    const auto freeBytes = fs::space(workspace.root).available;
     const std::uint64_t reserve = 64ULL * 1024 * 1024;
-    require(freeBytes > reserve && plan.expanded <= freeBytes - reserve && portableBytes <= freeBytes - reserve - plan.expanded,
-            "Not enough disk space for extraction and a copy of portable user data");
-    extractZip(zip, staged, plan, threads);
+    bool streamed = false;
+
+    if (options.stream && !options.keepZip) {
+        try {
+            std::cout << "探测服务器分段支持并预读目录结构...\n";
+            const auto probe = probeRemote(remote.url);
+            if (probe.supportsRange && probe.totalSize > 0 && probe.totalSize <= updater::maxArchiveBytes) {
+                const auto streamPlan = fetchAndPlanCentralDirectory(remote.url, probe.totalSize, probe.etag);
+                if (streamPlan.isSequential) {
+                    const auto freeBytes = fs::space(workspace.root).available;
+                    require(freeBytes > reserve && streamPlan.expanded <= freeBytes - reserve &&
+                            portableBytes <= freeBytes - reserve - streamPlan.expanded,
+                            "Not enough disk space for streaming extraction and portable user data");
+                    std::cout << "开始边下载边解压 (流式提速模式)...\n";
+                    streamDownloadAndExtract(remote, staged, streamPlan, probe.totalSize, probe.etag);
+                    streamed = true;
+                } else {
+                    std::cout << "压缩包非顺序排列，降级为常规分段下载...\n";
+                }
+            } else {
+                std::cout << "服务器未支持精确分段，降级为常规下载...\n";
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "流式解压预检或执行未完成 (" << e.what() << ")，回退到常规安全下载...\n";
+            std::error_code ec;
+            fs::remove_all(staged, ec);
+            fs::create_directory(staged, ec);
+        }
+    }
+
+    if (!streamed) {
+        std::cout << "下载并验证安装包...\n";
+        download(remote, zip, threads);
+        const auto plan = inspectZip(zip);
+        const auto freeBytes = fs::space(workspace.root).available;
+        require(freeBytes > reserve && plan.expanded <= freeBytes - reserve && portableBytes <= freeBytes - reserve - plan.expanded,
+                "Not enough disk space for extraction and a copy of portable user data");
+        extractZip(zip, staged, plan, threads);
+    }
+
     const auto stagedIdentity = localIdentity(staged);
     require(updater::sameBuild(stagedIdentity, remote.id), "Extracted VS Code version/commit/channel/architecture does not match official metadata");
     ensureNotRunning(target);
@@ -727,7 +1113,7 @@ int run(const updater::Options& options) {
     // Installation is committed. Cleanup failures must not be reported as a failed installation.
     try {
         writeJson(workspace.root / "recovery.json", {{"target", pathText(target)}, {"backup", pathText(backup)}, {"state", "installed"}});
-        if (!options.keepZip) fs::remove(zip);
+        if (!options.keepZip && fs::exists(zip)) fs::remove(zip);
         if (!hasOld && !options.keepZip) { fs::remove(workspace.root / "recovery.json"); fs::remove(workspace.root); }
     } catch (const std::exception& e) { std::cerr << "更新成功，但清理/记录失败: " << e.what() << '\n'; }
     std::cout << "更新成功: " << remote.id.version << '\n';
@@ -746,7 +1132,9 @@ void usage() {
         "  --threads <1-16>   下载/解压线程数，默认自动\n"
         "  --check            仅检查；检查失败返回非零退出码\n"
         "  --force            重新安装目标构建，不绕过安全校验\n"
-        "  --keep-zip         保留已验证的安装包\n"
+        "  --stream           边下载边解压流式提速（默认启用）\n"
+        "  --no-stream        禁用流式解压，采用先完整下载再解压\n"
+        "  --keep-zip         保留已验证的安装包（自动禁用流式）\n"
         "  --pause            完成后等待按键（仅交互终端）\n"
         "  --no-pause         不等待按键（默认）\n"
         "  --help, -h         显示帮助\n";

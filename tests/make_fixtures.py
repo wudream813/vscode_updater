@@ -33,3 +33,10 @@ data[30 + name_len + extra_len] ^= 1  # change payload without updating CRC
 corrupt.write_bytes(data)
 (root / "truncated.zip").write_bytes(b"PK\x03\x04broken")
 print(f"Created offline fixtures in {root}")
+
+# Add stream.zip for streaming tests
+import zipfile
+with zipfile.ZipFile(root / "stream.zip", "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    zf.writestr("test1.txt", "Hello World! " * 20)
+    zf.writestr("sub/test2.txt", "Decompression test!")
+    zf.writestr("sub/empty/", "")
