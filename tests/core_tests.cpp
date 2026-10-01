@@ -128,36 +128,6 @@ int main() {
         activate(false, [&](const char* from, const char* to) { ++moves; check(std::string(from) == "staged" && std::string(to) == "target", "fresh install transition"); });
         check(moves == 1, "fresh install moved nonexistent old install");
 
-        // Central Directory and EOCD parsing tests
-        {
-            std::ifstream f("/tmp/sample.zip", std::ios::binary);
-            std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-            auto eocd = findEocd(data.data(), data.size(), data.size());
-            check(eocd.totalEntries == 3, "sample EOCD entries");
-            check(eocd.cdSize == 170, "sample EOCD CD size");
-            auto plan = parseCentralDirectory(data.data() + eocd.cdOffset, eocd.cdSize, eocd.totalEntries, data.size());
-            check(plan.entries.size() == 3, "sample CD entries count");
-            check(plan.isSequential, "sample CD sequential layout");
-            check(plan.expanded == 279, "sample CD expanded bytes");
-            check(plan.entries[0].safePath == "test1.txt", "sample entry 0 path");
-            check(plan.entries[1].safePath == "sub/test2.txt", "sample entry 1 path");
-            check(plan.entries[2].safePath == "sub/empty", "sample entry 2 path");
-            check(plan.entries[2].isDirectory, "sample entry 2 is directory");
-
-            // Rejections on corrupt EOCD
-            rejects([&] { findEocd(data.data(), 10, data.size()); }, "truncated tail accepted");
-            std::vector<uint8_t> badEocd = data;
-            for (size_t i = data.size() - 22; i < data.size(); ++i) badEocd[i] = 0;
-            rejects([&] { findEocd(badEocd.data(), badEocd.size(), badEocd.size()); }, "missing EOCD accepted");
-
-            // Out of bounds CD offset
-            std::vector<uint8_t> oobData = data;
-            size_t eocdPos = data.size() - 22;
-            oobData[eocdPos + 16] = 0xff;
-            oobData[eocdPos + 17] = 0xff;
-            rejects([&] { findEocd(oobData.data(), oobData.size(), data.size()); }, "out of bounds CD accepted");
-        }
-
         // Central Directory and EOCD parsing tests (embedded standalone ZIP buffer)
         {
             static const std::uint8_t sampleZip[] = {
