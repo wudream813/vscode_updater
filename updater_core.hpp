@@ -51,6 +51,7 @@ struct Options {
     bool check = false;
     bool keepZip = false;
     bool stream = true; // stream download and decompress on the fly by default
+    bool plain = false; // plain text output without modern TUI
     bool pause = false; // scripts never block by default
     bool help = false;
 };
@@ -77,6 +78,7 @@ inline Options parseOptions(const std::vector<std::string>& args, const std::str
         else if (a == "--keep-zip") o.keepZip = true;
         else if (a == "--stream") o.stream = true;
         else if (a == "--no-stream") o.stream = false;
+        else if (a == "--plain") o.plain = true;
         else if (a == "--pause") o.pause = true;
         else if (a == "--no-pause") o.pause = false;
         else if (a == "--help" || a == "-h") o.help = true;

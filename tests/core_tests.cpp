@@ -30,6 +30,8 @@ int main() {
         check(parseOptions({"--threads", "16", "--check", "--quality", "insider"}).threads == 16, "CLI options");
         check(parseOptions({}).stream, "must stream by default");
         check(!parseOptions({"--no-stream"}).stream, "explicit no-stream");
+        check(!parseOptions({}).plain, "default not plain");
+        check(parseOptions({"--plain"}).plain, "explicit plain");
         check(!parseOptions({"--pause", "--no-pause"}).pause, "explicit no-pause");
         for (const auto* arg : {"0", "17", "-1", "abc", "8x", "99999999999999999999"})
             rejects([&] { parseOptions({"--threads", arg}); }, "bad thread count accepted");

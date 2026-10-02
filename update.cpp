@@ -41,6 +41,220 @@ using namespace std::chrono_literals;
 namespace {
 bool interactiveOutput = false;
 
+enum class StepStatus {
+    Pending,
+    Active,
+    Success,
+    Failed,
+    Skipped
+};
+
+struct StepInfo {
+    std::string name;
+    std::string detail;
+    StepStatus status = StepStatus::Pending;
+};
+
+class ModernUI {
+public:
+    bool enabled = false;
+    bool colorSupported = false;
+
+    enum StepIndex {
+        STEP_QUERY = 0,
+        STEP_AUDIT,
+        STEP_EXTRACT,
+        STEP_VERIFY,
+        STEP_APPLY,
+        STEP_COUNT
+    };
+
+    std::array<StepInfo, STEP_COUNT> steps;
+    std::string targetDir;
+    std::string arch;
+    std::string quality;
+    bool headerRendered = false;
+
+    void init(bool interactive, bool forcePlain, const std::string& dir,
+              const std::string& a, const std::string& q) {
+        targetDir = dir;
+        arch = a;
+        quality = q;
+        enabled = interactive && !forcePlain;
+
+        steps[STEP_QUERY]   = {"查询官方更新信息", "", StepStatus::Pending};
+        steps[STEP_AUDIT]   = {"预读目录安全审计", "", StepStatus::Pending};
+        steps[STEP_EXTRACT] = {"边下载边解压 (流式提速)", "", StepStatus::Pending};
+        steps[STEP_VERIFY]  = {"同步核验官方 SHA-256", "", StepStatus::Pending};
+        steps[STEP_APPLY]   = {"便携版数据保留与原子切换", "", StepStatus::Pending};
+
+        if (enabled) {
+            HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+            DWORD mode = 0;
+            if (GetConsoleMode(hOut, &mode)) {
+                if (SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+                    colorSupported = true;
+                }
+            }
+        }
+    }
+
+    void renderHeader() {
+        if (!enabled) {
+            std::cout << "VS Code 更新器 | " << arch << " | " << quality << "\n目标: " << targetDir << "\n";
+            return;
+        }
+        clearScreen();
+        std::cout << (colorSupported ? "\033[1;36m" : "")
+                  << "┌─────────────────────────────────────────────────────────────┐\n"
+                  << "│  VS Code Portable Updater                                   │\n"
+                  << "└─────────────────────────────────────────────────────────────┘"
+                  << (colorSupported ? "\033[0m\n" : "\n");
+        std::cout << (colorSupported ? "\033[90m" : "")
+                  << "  目标架构: " << arch << "  •  更新渠道: " << quality
+                  << "  •  目标: " << targetDir
+                  << (colorSupported ? "\033[0m\n\n" : "\n\n");
+        headerRendered = true;
+        renderDashboard();
+    }
+
+    void setStep(StepIndex idx, StepStatus status, const std::string& detail = "") {
+        steps[idx].status = status;
+        if (!detail.empty()) steps[idx].detail = detail;
+        if (!enabled) {
+            std::string prefix;
+            switch (status) {
+                case StepStatus::Active:  prefix = "[..] "; break;
+                case StepStatus::Success: prefix = "[OK] "; break;
+                case StepStatus::Failed:  prefix = "[ERR] "; break;
+                case StepStatus::Skipped: prefix = "[--] "; break;
+                default:                  prefix = "     "; break;
+            }
+            std::cout << prefix << steps[idx].name;
+            if (!detail.empty()) std::cout << " (" << detail << ")";
+            std::cout << '\n';
+            return;
+        }
+        renderDashboard();
+    }
+
+    void renderDashboard(double progressRatio = -1.0,
+                         double currentMiB = 0.0, double totalMiB = 0.0,
+                         double speedMiB = 0.0, std::uint64_t etaSeconds = 0,
+                         std::size_t extractedFiles = 0, std::size_t totalFiles = 0,
+                         const std::string& currentFile = "") {
+        if (!enabled) return;
+
+        if (colorSupported) {
+            std::cout << "\033[5;1H";
+            std::cout << "\033[1m更新流水线:\033[0m\n";
+        } else {
+            std::cout << "\r更新流水线:\n";
+        }
+
+        for (int i = 0; i < STEP_COUNT; ++i) {
+            const auto& st = steps[i];
+            std::string icon;
+            std::string color;
+            switch (st.status) {
+                case StepStatus::Success:
+                    icon = "[✔]";
+                    color = colorSupported ? "\033[32;1m" : "";
+                    break;
+                case StepStatus::Active:
+                    icon = "[▶]";
+                    color = colorSupported ? "\033[33;1m" : "";
+                    break;
+                case StepStatus::Failed:
+                    icon = "[✘]";
+                    color = colorSupported ? "\033[31;1m" : "";
+                    break;
+                case StepStatus::Skipped:
+                    icon = "[-]";
+                    color = colorSupported ? "\033[90m" : "";
+                    break;
+                default:
+                    icon = "[ ]";
+                    color = colorSupported ? "\033[90m" : "";
+                    break;
+            }
+
+            std::cout << "  " << color << icon << " " << (i + 1) << ". " << st.name;
+            if (colorSupported) std::cout << "\033[0m";
+
+            int pad = 30 - static_cast<int>(st.name.size());
+            if (pad < 2) pad = 2;
+            std::cout << std::string(pad, ' ');
+
+            if (!st.detail.empty()) {
+                std::cout << (colorSupported ? "\033[90m" : "") << st.detail << (colorSupported ? "\033[0m" : "");
+            }
+            std::cout << (colorSupported ? "\033[K\n" : "                                  \n");
+
+            if (st.status == StepStatus::Active && progressRatio >= 0.0) {
+                std::cout << "         " << renderProgressBar(progressRatio, 24) << "  ";
+                std::cout << std::fixed << std::setprecision(1) << (progressRatio * 100.0) << "%";
+                if (speedMiB > 0.01) {
+                    std::cout << "  •  " << speedMiB << " MiB/s";
+                }
+                if (totalMiB > 0.1) {
+                    std::cout << "  (" << currentMiB << "/" << totalMiB << " MiB)";
+                }
+                if (etaSeconds > 0) {
+                    std::cout << "  •  剩余 " << etaSeconds << "s";
+                }
+                std::cout << (colorSupported ? "\033[K\n" : "       \n");
+
+                if (!currentFile.empty() || totalFiles > 0) {
+                    std::string displayFile = currentFile;
+                    if (displayFile.size() > 40) displayFile = "..." + displayFile.substr(displayFile.size() - 37);
+                    std::cout << (colorSupported ? "\033[90m" : "")
+                              << "         正在提取: " << displayFile;
+                    if (totalFiles > 0) {
+                        std::cout << "  [" << extractedFiles << "/" << totalFiles << "]";
+                    }
+                    std::cout << (colorSupported ? "\033[0m\033[K\n" : "                             \n");
+                }
+            }
+        }
+        std::cout << std::flush;
+    }
+
+    void finish(bool success, const std::string& msg = "") {
+        if (!enabled) {
+            if (!msg.empty()) std::cout << (success ? "成功: " : "失败: ") << msg << '\n';
+            return;
+        }
+        std::cout << "\n" << (colorSupported ? (success ? "\033[32;1m" : "\033[31;1m") : "");
+        std::cout << (success ? "🎉 " : "❌ ") << msg;
+        std::cout << (colorSupported ? "\033[0m\n\n" : "\n\n");
+    }
+
+private:
+    void clearScreen() {
+        if (colorSupported) {
+            std::cout << "\033[2J\033[H";
+        }
+    }
+
+    std::string renderProgressBar(double ratio, int width = 24) {
+        if (ratio < 0.0) ratio = 0.0;
+        if (ratio > 1.0) ratio = 1.0;
+        int filled = static_cast<int>(ratio * width);
+        std::string bar;
+        bar.reserve(width * 4);
+        if (colorSupported) bar += "\033[36;1m";
+        for (int i = 0; i < filled; ++i) bar += "━";
+        if (colorSupported) bar += "\033[90m";
+        for (int i = filled; i < width; ++i) bar += "─";
+        if (colorSupported) bar += "\033[0m";
+        return bar;
+    }
+};
+
+ModernUI ui;
+
+
 std::string utf8(const std::wstring& s) {
     if (s.empty()) return {};
     const int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, s.data(), static_cast<int>(s.size()), nullptr, 0, nullptr, nullptr);
@@ -436,18 +650,28 @@ void parallelWork(int count, std::vector<Progress>& progress, std::uint64_t tota
             for (auto& p : progress) current += p.count.load();
             const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             const double rate = elapsed > 0.01 ? current / elapsed : 0;
-            std::ostringstream line;
-            line << '\r' << title << ": " << (total ? std::min<std::uint64_t>(100, current * 100 / total) : 0)
-                 << "%  " << std::fixed << std::setprecision(1);
-            if (byteProgress) line << current / 1048576.0 << "/" << total / 1048576.0 << " MiB  " << rate / 1048576.0 << " MiB/s";
-            else line << current << "/" << total << " files  " << rate << " files/s";
-            if (rate > 0 && current < total) line << "  ETA " << static_cast<unsigned long long>((total - current) / rate) << "s";
-            std::cout << line.str() << "                    " << std::flush;
+            const double ratio = total ? static_cast<double>(current) / static_cast<double>(total) : 0.0;
+            const std::uint64_t eta = (rate > 0 && current < total) ? static_cast<std::uint64_t>((total - current) / rate) : 0;
+            if (ui.enabled) {
+                if (byteProgress) {
+                    ui.renderDashboard(ratio, current / 1048576.0, total / 1048576.0, rate / 1048576.0, eta);
+                } else {
+                    ui.renderDashboard(ratio, 0.0, 0.0, 0.0, eta, current, total);
+                }
+            } else {
+                std::ostringstream line;
+                line << '\r' << title << ": " << (total ? std::min<std::uint64_t>(100, current * 100 / total) : 0)
+                     << "%  " << std::fixed << std::setprecision(1);
+                if (byteProgress) line << current / 1048576.0 << "/" << total / 1048576.0 << " MiB  " << rate / 1048576.0 << " MiB/s";
+                else line << current << "/" << total << " files  " << rate << " files/s";
+                if (rate > 0 && current < total) line << "  ETA " << eta << "s";
+                std::cout << line.str() << "                    " << std::flush;
+            }
         }
         std::this_thread::sleep_for(100ms);
     }
     for (auto& t : workers) t.join();
-    if (interactiveOutput) std::cout << '\r' << title << ": finished                                                            \n";
+    if (interactiveOutput && !ui.enabled) std::cout << '\r' << title << ": finished                                                            \n";
     for (const auto& error : errors) if (!error.empty()) throw std::runtime_error(error);
 }
 
@@ -880,24 +1104,33 @@ void streamDownloadAndExtract(const Remote& remote, const fs::path& staged,
         if (interactiveOutput) {
             const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             const double rate = elapsed > 0.01 ? bytesReceived / elapsed : 0;
-            std::ostringstream line;
-            line << "\r边下边解: " << (totalSize ? std::min<std::uint64_t>(100, bytesReceived * 100 / totalSize) : 0)
-                 << "%  " << std::fixed << std::setprecision(1)
-                 << bytesReceived / 1048576.0 << "/" << totalSize / 1048576.0 << " MiB  "
-                 << rate / 1048576.0 << " MiB/s  [" << extractedCount << "/" << plan.entries.size() << " files]";
-            if (rate > 0 && bytesReceived < totalSize) {
-                line << "  ETA " << static_cast<unsigned long long>((totalSize - bytesReceived) / rate) << "s";
+            const double ratio = totalSize ? static_cast<double>(bytesReceived) / static_cast<double>(totalSize) : 0.0;
+            const std::uint64_t eta = (rate > 0 && bytesReceived < totalSize) ? static_cast<std::uint64_t>((totalSize - bytesReceived) / rate) : 0;
+            if (ui.enabled) {
+                ui.renderDashboard(ratio, bytesReceived / 1048576.0, totalSize / 1048576.0,
+                                   rate / 1048576.0, eta, extractedCount, plan.entries.size(),
+                                   currentFilePath.filename().string());
+            } else {
+                std::ostringstream line;
+                line << "\r边下边解: " << (totalSize ? std::min<std::uint64_t>(100, bytesReceived * 100 / totalSize) : 0)
+                     << "%  " << std::fixed << std::setprecision(1)
+                     << bytesReceived / 1048576.0 << "/" << totalSize / 1048576.0 << " MiB  "
+                     << rate / 1048576.0 << " MiB/s  [" << extractedCount << "/" << plan.entries.size() << " files]";
+                if (rate > 0 && bytesReceived < totalSize) {
+                    line << "  ETA " << eta << "s";
+                }
+                std::cout << line.str() << "                    " << std::flush;
             }
-            std::cout << line.str() << "                    " << std::flush;
         }
     }
 
-    if (interactiveOutput) {
+    if (interactiveOutput && !ui.enabled) {
         std::cout << "\r边下边解: 完成 (已提取 " << extractedCount << " 个文件)                                              \n";
     }
 
     require(unpacker.isComplete(), "Incomplete archive decompression");
-    std::cout << "校验 SHA-256...\n";
+    ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Success, "已提取 " + std::to_string(extractedCount) + " 个文件");
+    ui.setStep(ModernUI::STEP_VERIFY, StepStatus::Active, "计算哈希值...");
     const std::string computedSha = hasher.finish();
     require(computedSha == remote.sha256, "SHA-256 mismatch; stream integrity verification failed");
 }
@@ -1065,17 +1298,32 @@ struct Workspace {
 
 int run(const updater::Options& options) {
     const auto target = validateTarget(options.directory);
-    std::cout << "VS Code 更新器 | " << options.arch << " | " << options.quality << "\n目标: " << pathText(target) << '\n';
-    std::cout << "正在查询官方更新信息...\n";
+    ui.init(interactiveOutput, options.plain, pathText(target), options.arch, options.quality);
+    ui.renderHeader();
+
+    ui.setStep(ModernUI::STEP_QUERY, StepStatus::Active, "连接更新服务器...");
     const auto remote = fetchRemote(options); // fail closed: no unverified fallback download
     const auto local = localIdentity(target);
     const bool current = updater::sameBuild(local, remote.id);
-    std::cout << "远程版本: " << remote.id.version << " (" << remote.id.commit.substr(0, 12) << ")\n";
+    ui.setStep(ModernUI::STEP_QUERY, StepStatus::Success, remote.id.version + " (" + remote.id.commit.substr(0, 7) + ")");
+
     if (options.check) {
-        std::cout << (current ? "已是目标架构/渠道的最新构建。\n" : "需要安装或更新目标构建。\n");
+        if (current) {
+            ui.finish(true, "已是最新版本 (" + remote.id.version + ")，无需更新");
+        } else {
+            ui.finish(true, "检测到新版本: " + remote.id.version + " (当前: " + (local.version.empty() ? "未安装" : local.version) + ")");
+        }
         return 0;
     }
-    if (current && !options.force) { std::cout << "无需更新。\n"; return 0; }
+    if (current && !options.force) {
+        ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Skipped, "当前已是最新构建");
+        ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Skipped);
+        ui.setStep(ModernUI::STEP_VERIFY, StepStatus::Skipped);
+        ui.setStep(ModernUI::STEP_APPLY, StepStatus::Skipped);
+        ui.finish(true, "无需更新: " + remote.id.version);
+        return 0;
+    }
+
     fs::create_directories(target.parent_path());
     safeAncestors(target);
     const auto lockPath = target.parent_path() / (L"." + target.filename().native() + L".updater.lock");
@@ -1084,6 +1332,7 @@ int run(const updater::Options& options) {
                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr));
     require(lock.value != INVALID_HANDLE_VALUE, "Another updater is using this target, or the parent directory is not writable");
     ensureNotRunning(target);
+
     Workspace workspace(target);
     const auto zip = workspace.root / "vscode.zip", staged = workspace.root / "staged", backup = workspace.root / "previous";
     fs::create_directory(staged);
@@ -1095,7 +1344,7 @@ int run(const updater::Options& options) {
 
     if (options.stream && !options.keepZip) {
         try {
-            std::cout << "探测服务器分段支持并预读目录结构...\n";
+            ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Active, "探测分段支持与中央目录...");
             const auto probe = probeRemote(remote.url);
             if (probe.supportsRange && probe.totalSize > 0 && probe.totalSize <= updater::maxArchiveBytes) {
                 const auto streamPlan = fetchAndPlanCentralDirectory(remote.url, probe.totalSize, probe.etag);
@@ -1104,17 +1353,19 @@ int run(const updater::Options& options) {
                     require(freeBytes > reserve && streamPlan.expanded <= freeBytes - reserve &&
                             portableBytes <= freeBytes - reserve - streamPlan.expanded,
                             "Not enough disk space for streaming extraction and portable user data");
-                    std::cout << "开始边下载边解压 (流式提速模式)...\n";
+                    ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Success, "安全校验通过 (" + std::to_string(streamPlan.entries.size()) + " files)");
+                    ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Active, "流式提取中...");
                     streamDownloadAndExtract(remote, staged, streamPlan, probe.totalSize, probe.etag);
+                    ui.setStep(ModernUI::STEP_VERIFY, StepStatus::Success, "SHA-256 核验一致");
                     streamed = true;
                 } else {
-                    std::cout << "压缩包非顺序排列，降级为常规分段下载...\n";
+                    ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Success, "非顺序排列，回退普通分段");
                 }
             } else {
-                std::cout << "服务器未支持精确分段，降级为常规下载...\n";
+                ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Success, "不支持分段，回退常规下载");
             }
         } catch (const std::exception& e) {
-            std::cerr << "流式解压预检或执行未完成 (" << e.what() << ")，回退到常规安全下载...\n";
+            ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Failed, e.what());
             std::error_code ec;
             fs::remove_all(staged, ec);
             fs::create_directory(staged, ec);
@@ -1122,24 +1373,31 @@ int run(const updater::Options& options) {
     }
 
     if (!streamed) {
-        std::cout << "下载并验证安装包...\n";
+        ui.steps[ModernUI::STEP_EXTRACT].name = "分段下载与并行解压";
+        ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Active, "多线程下载安装包...");
         download(remote, zip, threads);
+        ui.setStep(ModernUI::STEP_VERIFY, StepStatus::Success, "SHA-256 核验一致");
+
+        ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Active, "解包目录安全审计...");
         const auto plan = inspectZip(zip);
         const auto freeBytes = fs::space(workspace.root).available;
         require(freeBytes > reserve && plan.expanded <= freeBytes - reserve && portableBytes <= freeBytes - reserve - plan.expanded,
                 "Not enough disk space for extraction and a copy of portable user data");
+        ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Success, "安全校验通过");
+
+        ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Active, "解压至暂存目录...");
         extractZip(zip, staged, plan, threads);
+        ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Success, "解压完成");
     }
 
     const auto stagedIdentity = localIdentity(staged);
     require(updater::sameBuild(stagedIdentity, remote.id), "Extracted VS Code version/commit/channel/architecture does not match official metadata");
     ensureNotRunning(target);
-    std::cout << "保留便携版 data 目录...\n";
+
+    ui.setStep(ModernUI::STEP_APPLY, StepStatus::Active, "保留 portable data 目录...");
     copyData(target / "data", staged / "data");
     writeJson(staged / ".vscode-updater.json", {{"version", remote.id.version}, {"commit", remote.id.commit},
               {"arch", remote.id.arch}, {"quality", remote.id.quality}, {"sha256", remote.sha256}});
-    // Revalidate immediately before changing the installation. A process could still
-    // start after this check; Windows rename failure then takes the rollback path.
     validateTarget(options.directory);
     ensureNotRunning(target);
     const bool hasOld = fs::exists(target);
@@ -1150,19 +1408,22 @@ int run(const updater::Options& options) {
     try {
         updater::activate(hasOld, [&](const char* from, const char* to) { fs::rename(locations.at(from), locations.at(to)); });
     } catch (...) {
+        ui.setStep(ModernUI::STEP_APPLY, StepStatus::Failed, "切换失败已回滚");
         std::cerr << "切换失败，已尝试回滚。请检查恢复目录: " << pathText(workspace.root) << '\n';
         throw;
     }
-    // Installation is committed. Cleanup failures must not be reported as a failed installation.
     try {
         writeJson(workspace.root / "recovery.json", {{"target", pathText(target)}, {"backup", pathText(backup)}, {"state", "installed"}});
         if (!options.keepZip && fs::exists(zip)) fs::remove(zip);
         if (!hasOld && !options.keepZip) { fs::remove(workspace.root / "recovery.json"); fs::remove(workspace.root); }
     } catch (const std::exception& e) { std::cerr << "更新成功，但清理/记录失败: " << e.what() << '\n'; }
-    std::cout << "更新成功: " << remote.id.version << '\n';
-    if (hasOld) std::cout << "旧版本及其原始 data 已备份，确认新版本正常后可手动清理: " << pathText(backup) << '\n';
+
+    ui.setStep(ModernUI::STEP_APPLY, StepStatus::Success, "切换完成并就绪");
+    ui.finish(true, "VS Code " + remote.id.version + " 更新成功！");
+
+    if (hasOld) std::cout << "旧版本及其原始 data 已备份: " << pathText(backup) << '\n';
     if (options.keepZip) std::cout << "已保留安装包: " << pathText(zip) << '\n';
-    std::cout << "启动: " << pathText(target / (options.quality == "insider" ? "Code - Insiders.exe" : "Code.exe")) << '\n';
+    std::cout << "启动程序: " << pathText(target / (options.quality == "insider" ? "Code - Insiders.exe" : "Code.exe")) << '\n';
     return 0;
 }
 
@@ -1177,6 +1438,7 @@ void usage() {
         "  --force            重新安装目标构建，不绕过安全校验\n"
         "  --stream           边下载边解压流式提速（默认启用）\n"
         "  --no-stream        禁用流式解压，采用先完整下载再解压\n"
+        "  --plain            纯文本输出模式（关闭图形化 TUI 面板）\n"
         "  --keep-zip         保留已验证的安装包（自动禁用流式）\n"
         "  --pause            完成后等待按键（仅交互终端）\n"
         "  --no-pause         不等待按键（默认）\n"
