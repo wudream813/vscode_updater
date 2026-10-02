@@ -59,6 +59,7 @@ class ModernUI {
 public:
     bool enabled = false;
     bool colorSupported = false;
+    bool inAltScreen = false;
 
     enum StepIndex {
         STEP_QUERY = 0,
@@ -74,6 +75,10 @@ public:
     std::string arch;
     std::string quality;
     bool headerRendered = false;
+
+    ~ModernUI() {
+        restoreScreen();
+    }
 
     void init(bool interactive, bool forcePlain, const std::string& dir,
               const std::string& a, const std::string& q) {
@@ -94,8 +99,19 @@ public:
             if (GetConsoleMode(hOut, &mode)) {
                 if (SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
                     colorSupported = true;
+                    // Switch to alternate screen buffer, clear screen, and hide cursor
+                    std::cout << "\033[?1049h\033[2J\033[H\033[?25l" << std::flush;
+                    inAltScreen = true;
                 }
             }
+        }
+    }
+
+    void restoreScreen() {
+        if (inAltScreen) {
+            // Restore primary screen buffer and show cursor
+            std::cout << "\033[?25h\033[?1049l" << std::flush;
+            inAltScreen = false;
         }
     }
 
@@ -158,15 +174,15 @@ public:
             std::string color;
             switch (st.status) {
                 case StepStatus::Success:
-                    icon = "[✔]";
+                    icon = "[√]";
                     color = colorSupported ? "\033[32;1m" : "";
                     break;
                 case StepStatus::Active:
-                    icon = "[▶]";
+                    icon = "[>]";
                     color = colorSupported ? "\033[33;1m" : "";
                     break;
                 case StepStatus::Failed:
-                    icon = "[✘]";
+                    icon = "[x]";
                     color = colorSupported ? "\033[31;1m" : "";
                     break;
                 case StepStatus::Skipped:
@@ -220,13 +236,59 @@ public:
         std::cout << std::flush;
     }
 
+    bool promptConfirmContinue(const std::string& currentVer, const std::string& commit) {
+        if (!enabled) {
+            std::cout << "\n当前安装已是目标渠道最新版本 (" << currentVer << ")。\n是否仍要重新安装？[y/N]: " << std::flush;
+            std::string line;
+            if (std::getline(std::cin, line)) {
+                return !line.empty() && (line[0] == 'y' || line[0] == 'Y');
+            }
+            return false;
+        }
+
+        // Draw modal pop-up in full screen TUI
+        std::cout << "\033[13;1H";
+        std::cout << (colorSupported ? "\033[1;36m" : "")
+                  << "  ┌─────────────────────────────────────────────────────────┐\n"
+                  << "  │                       更新确认                          │\n"
+                  << "  ├─────────────────────────────────────────────────────────┤\n"
+                  << (colorSupported ? "\033[0m" : "");
+        std::cout << "  │  当前本地安装已是目标渠道最新构建: " << std::left << std::setw(21) << currentVer << "│\n";
+        std::string shortCommit = commit.size() > 16 ? commit.substr(0, 16) + "..." : commit;
+        std::cout << "  │  构建提交: " << std::left << std::setw(45) << shortCommit << "│\n";
+        std::cout << "  │                                                         │\n";
+        std::cout << "  │  是否继续强制重新安装？                                 │\n";
+        std::cout << "  │                                                         │\n";
+        std::cout << "  │           "
+                  << (colorSupported ? "\033[1;32m[Y] 确认重新安装\033[0m" : "[Y] 确认重新安装")
+                  << "     "
+                  << (colorSupported ? "\033[1;90m[N] 取消退出\033[0m" : "[N] 取消退出")
+                  << "              │\n";
+        std::cout << (colorSupported ? "\033[1;36m" : "")
+                  << "  └─────────────────────────────────────────────────────────┘\n"
+                  << (colorSupported ? "\033[0m" : "") << std::flush;
+
+        // Interactive keypress
+        while (true) {
+            int ch = _getch();
+            if (ch == 'y' || ch == 'Y') {
+                // Clear modal lines
+                std::cout << "\033[13;1H\033[J" << std::flush;
+                return true;
+            }
+            if (ch == 'n' || ch == 'N' || ch == 27 /* Esc */ || ch == '\r' || ch == '\n') {
+                return false;
+            }
+        }
+    }
+
     void finish(bool success, const std::string& msg = "") {
         if (!enabled) {
-            if (!msg.empty()) std::cout << (success ? "成功: " : "失败: ") << msg << '\n';
+            if (!msg.empty()) std::cout << (success ? "[成功] " : "[失败] ") << msg << '\n';
             return;
         }
-        std::cout << "\n" << (colorSupported ? (success ? "\033[32;1m" : "\033[31;1m") : "");
-        std::cout << (success ? "🎉 " : "❌ ") << msg;
+        std::cout << "\033[13;1H\033[J\n" << (colorSupported ? (success ? "\033[32;1m" : "\033[31;1m") : "");
+        std::cout << (success ? "[完成] " : "[错误] ") << msg;
         std::cout << (colorSupported ? "\033[0m\n\n" : "\n\n");
     }
 
@@ -1316,12 +1378,26 @@ int run(const updater::Options& options) {
         return 0;
     }
     if (current && !options.force) {
-        ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Skipped, "当前已是最新构建");
-        ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Skipped);
-        ui.setStep(ModernUI::STEP_VERIFY, StepStatus::Skipped);
-        ui.setStep(ModernUI::STEP_APPLY, StepStatus::Skipped);
-        ui.finish(true, "无需更新: " + remote.id.version);
-        return 0;
+        // If interactive, prompt dialog whether to continue reinstalling
+        if (interactiveOutput && !options.plain) {
+            bool proceed = ui.promptConfirmContinue(remote.id.version, remote.id.commit);
+            if (!proceed) {
+                ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Skipped, "当前已是最新构建");
+                ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Skipped);
+                ui.setStep(ModernUI::STEP_VERIFY, StepStatus::Skipped);
+                ui.setStep(ModernUI::STEP_APPLY, StepStatus::Skipped);
+                ui.finish(true, "用户取消操作，当前已是最新版本: " + remote.id.version);
+                return 0;
+            }
+            ui.setStep(ModernUI::STEP_QUERY, StepStatus::Success, remote.id.version + " (用户确认重新安装)");
+        } else {
+            ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Skipped, "当前已是最新构建");
+            ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Skipped);
+            ui.setStep(ModernUI::STEP_VERIFY, StepStatus::Skipped);
+            ui.setStep(ModernUI::STEP_APPLY, StepStatus::Skipped);
+            ui.finish(true, "无需更新: " + remote.id.version);
+            return 0;
+        }
     }
 
     fs::create_directories(target.parent_path());
