@@ -149,6 +149,17 @@ public:
                     // Switch to alternate screen buffer, clear screen, and hide cursor
                     std::cout << "\033[?1049h\033[2J\033[H\033[?25l" << std::flush;
                     inAltScreen = true;
+
+                    // Register console control handler to restore primary screen on Ctrl+C / close
+                    SetConsoleCtrlHandler([](DWORD signal) -> BOOL {
+                        if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT || signal == CTRL_CLOSE_EVENT) {
+                            HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+                            DWORD w = 0;
+                            const char seq[] = "\033[?25h\033[?1049l\n";
+                            WriteConsoleA(h, seq, sizeof(seq) - 1, &w, nullptr);
+                        }
+                        return FALSE; // Allow default termination
+                    }, TRUE);
                 }
             }
         }
@@ -1558,7 +1569,10 @@ int run(const updater::Options& options) {
     ensureNotRunning(target);
 
     Workspace workspace(target);
-    const auto zip = workspace.root / "vscode.zip", staged = workspace.root / "staged", backup = workspace.root / "previous";
+    const auto cacheDir = target.parent_path() / (L"." + target.filename().native() + L".cache");
+    fs::create_directories(cacheDir);
+    const auto zip = cacheDir / (L"vscode-" + wide(remote.id.version) + L"-" + wide(remote.id.commit.substr(0, 10)) + L".zip");
+    const auto staged = workspace.root / "staged", backup = workspace.root / "previous";
     fs::create_directory(staged);
     const int automatic = static_cast<int>(std::min(8u, std::max(1u, std::thread::hardware_concurrency())));
     const int threads = options.threads ? options.threads : automatic;
@@ -1566,7 +1580,8 @@ int run(const updater::Options& options) {
     const std::uint64_t reserve = 64ULL * 1024 * 1024;
     bool streamed = false;
 
-    if (options.stream && !options.keepZip) {
+    const bool hasCachedZip = fs::exists(zip) && (fs::exists(zip.string() + ".part.json") || (fs::exists(zip) && fs::file_size(zip) > 0));
+    if (options.stream && !options.keepZip && !hasCachedZip) {
         try {
             ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Active, "探测分段支持与中央目录...");
             const auto probe = probeRemote(remote.url);
@@ -1638,7 +1653,10 @@ int run(const updater::Options& options) {
     }
     try {
         writeJson(workspace.root / "recovery.json", {{"target", pathText(target)}, {"backup", pathText(backup)}, {"state", "installed"}});
-        if (!options.keepZip && fs::exists(zip)) fs::remove(zip);
+        if (!options.keepZip) {
+            std::error_code ec;
+            fs::remove_all(cacheDir, ec);
+        }
         if (!hasOld && !options.keepZip) { fs::remove(workspace.root / "recovery.json"); fs::remove(workspace.root); }
     } catch (const std::exception& e) { std::cerr << "更新成功，但清理/记录失败: " << e.what() << '\n'; }
 
