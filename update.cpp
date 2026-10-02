@@ -41,6 +41,53 @@ using namespace std::chrono_literals;
 namespace {
 bool interactiveOutput = false;
 
+
+int cwidth(char32_t cp) {
+    if (cp == 0) return 0;
+    if (cp < 0x80) return 1;
+    // East Asian Wide / Fullwidth characters
+    if ((cp >= 0x1100 && cp <= 0x115F) ||
+        (cp >= 0x2E80 && cp <= 0xA4CF && cp != 0x303F) ||
+        (cp >= 0xAC00 && cp <= 0xD7A3) ||
+        (cp >= 0xF900 && cp <= 0xFAFF) ||
+        (cp >= 0xFE10 && cp <= 0xFE19) ||
+        (cp >= 0xFE30 && cp <= 0xFE6F) ||
+        (cp >= 0xFF00 && cp <= 0xFF60) ||
+        (cp >= 0xFFE0 && cp <= 0xFFE6) ||
+        (cp >= 0x20000 && cp <= 0x3FFFD)) {
+        return 2;
+    }
+    return 1;
+}
+
+int strDisplayWidth(const std::string& s) {
+    int w = 0;
+    for (std::size_t i = 0; i < s.size(); ) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        char32_t cp = 0;
+        int len = 1;
+        if (c < 0x80) { cp = c; len = 1; }
+        else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
+        else { i++; continue; }
+        if (i + len > s.size()) break;
+        for (int j = 1; j < len; ++j) {
+            cp = (cp << 6) | (static_cast<unsigned char>(s[i + j]) & 0x3F);
+        }
+        i += len;
+        w += cwidth(cp);
+    }
+    return w;
+}
+
+std::string padBoxLine(const std::string& content, int innerWidth) {
+    int currentWidth = strDisplayWidth(content);
+    int pad = innerWidth - currentWidth;
+    if (pad < 0) pad = 0;
+    return "  │" + content + std::string(pad, ' ') + "│\n";
+}
+
 enum class StepStatus {
     Pending,
     Active,
@@ -195,11 +242,13 @@ public:
                     break;
             }
 
+            std::string prefix = "  " + icon + " " + std::to_string(i + 1) + ". " + st.name;
+            int prefixWidth = strDisplayWidth(prefix);
+            int pad = 36 - prefixWidth;
+            if (pad < 2) pad = 2;
+
             std::cout << "  " << color << icon << " " << (i + 1) << ". " << st.name;
             if (colorSupported) std::cout << "\033[0m";
-
-            int pad = 30 - static_cast<int>(st.name.size());
-            if (pad < 2) pad = 2;
             std::cout << std::string(pad, ' ');
 
             if (!st.detail.empty()) {
@@ -246,37 +295,34 @@ public:
             return false;
         }
 
-        // Draw modal pop-up in full screen TUI
+        const int innerW = 58;
+        std::string shortCommit = commit.size() > 16 ? commit.substr(0, 16) + "..." : commit;
+
         std::cout << "\033[13;1H";
         std::cout << (colorSupported ? "\033[1;36m" : "")
-                  << "  ┌─────────────────────────────────────────────────────────┐\n"
-                  << "  │                       更新确认                          │\n"
-                  << "  ├─────────────────────────────────────────────────────────┤\n"
+                  << "  ┌──────────────────────────────────────────────────────────┐\n"
                   << (colorSupported ? "\033[0m" : "");
-        std::cout << "  │  当前本地安装已是目标渠道最新构建: " << std::left << std::setw(21) << currentVer << "│\n";
-        std::string shortCommit = commit.size() > 16 ? commit.substr(0, 16) + "..." : commit;
-        std::cout << "  │  构建提交: " << std::left << std::setw(45) << shortCommit << "│\n";
-        std::cout << "  │                                                         │\n";
-        std::cout << "  │  是否继续强制重新安装？                                 │\n";
-        std::cout << "  │                                                         │\n";
-        std::cout << "  │           "
-                  << (colorSupported ? "\033[1;32m[Y] 确认重新安装\033[0m" : "[Y] 确认重新安装")
-                  << "     "
-                  << (colorSupported ? "\033[1;90m[N] 取消退出\033[0m" : "[N] 取消退出")
-                  << "              │\n";
+        std::cout << padBoxLine("                      更新确认提示", innerW);
         std::cout << (colorSupported ? "\033[1;36m" : "")
-                  << "  └─────────────────────────────────────────────────────────┘\n"
+                  << "  ├──────────────────────────────────────────────────────────┤\n"
+                  << (colorSupported ? "\033[0m" : "");
+        std::cout << padBoxLine("  当前本地安装已是目标渠道最新构建: " + currentVer, innerW);
+        std::cout << padBoxLine("  构建提交: " + shortCommit, innerW);
+        std::cout << padBoxLine("", innerW);
+        std::cout << padBoxLine("  是否继续强制重新安装？", innerW);
+        std::cout << padBoxLine("", innerW);
+        std::cout << padBoxLine("           [Y] 确认重新安装     [N] 取消退出", innerW);
+        std::cout << (colorSupported ? "\033[1;36m" : "")
+                  << "  └──────────────────────────────────────────────────────────┘\n"
                   << (colorSupported ? "\033[0m" : "") << std::flush;
 
-        // Interactive keypress
         while (true) {
             int ch = _getch();
             if (ch == 'y' || ch == 'Y') {
-                // Clear modal lines
                 std::cout << "\033[13;1H\033[J" << std::flush;
                 return true;
             }
-            if (ch == 'n' || ch == 'N' || ch == 27 /* Esc */ || ch == '\r' || ch == '\n') {
+            if (ch == 'n' || ch == 'N' || ch == 27 || ch == '\r' || ch == '\n') {
                 return false;
             }
         }
@@ -315,6 +361,7 @@ private:
 };
 
 ModernUI ui;
+
 
 
 std::string utf8(const std::wstring& s) {
@@ -777,47 +824,148 @@ void downloadOnce(const Remote& remote, const fs::path& path, int requestedThrea
         updater::copyResponse([&](char* p, std::size_t n) { return probe.read(p, n); }, [](const char*, std::size_t) {}, 1, 1);
     }
     require(fs::space(path.parent_path()).available >= size + 64ULL * 1024 * 1024, "Not enough space for the download");
-    { std::ofstream f(path, std::ios::binary | std::ios::trunc); require(f.good(), "Cannot create download file"); }
-    fs::resize_file(path, size);
-    const int count = static_cast<int>(std::min<std::uint64_t>(requestedThreads, std::max<std::uint64_t>(1, size / (256 * 1024))));
+
+    const std::uint64_t chunkSize = 2ULL * 1024 * 1024; // 2 MiB chunks for granular resumability
+    const std::size_t totalChunks = static_cast<std::size_t>((size + chunkSize - 1) / chunkSize);
+    const auto metaPath = path.string() + ".part.json";
+
+    std::vector<bool> chunkCompleted(totalChunks, false);
+    std::uint64_t existingBytes = 0;
+
+    // Check if partial download file and meta match
+    if (fs::exists(path) && fs::exists(metaPath) && fs::file_size(path) == size) {
+        try {
+            const auto meta = readJson(metaPath);
+            if (meta.value("url", "") == remote.url &&
+                meta.value("etag", "") == etag &&
+                meta.value("size", 0ULL) == size &&
+                meta.value("chunkSize", 0ULL) == chunkSize &&
+                meta.value("sha256", "") == remote.sha256) {
+                const auto compList = meta.value("completed", std::vector<std::size_t>{});
+                for (auto idx : compList) {
+                    if (idx < totalChunks && !chunkCompleted[idx]) {
+                        chunkCompleted[idx] = true;
+                        const auto len = std::min(chunkSize, size - idx * chunkSize);
+                        existingBytes += len;
+                    }
+                }
+            }
+        } catch (...) {
+            chunkCompleted.assign(totalChunks, false);
+            existingBytes = 0;
+        }
+    }
+
+    if (existingBytes == 0) {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        require(f.good(), "Cannot create download file");
+        f.close();
+        fs::resize_file(path, size);
+    }
+
+    struct Job {
+        std::size_t index;
+        std::uint64_t offset;
+        std::uint64_t length;
+    };
+
+    std::vector<Job> jobs;
+    for (std::size_t i = 0; i < totalChunks; ++i) {
+        if (!chunkCompleted[i]) {
+            const auto off = i * chunkSize;
+            const auto len = std::min(chunkSize, size - off);
+            jobs.push_back({i, off, len});
+        }
+    }
+
+    if (jobs.empty()) {
+        std::error_code ec;
+        fs::remove(metaPath, ec);
+        return;
+    }
+
+    const int count = static_cast<int>(std::min<std::uint64_t>(requestedThreads, std::max<std::uint64_t>(1, jobs.size())));
     std::vector<Progress> progress(count);
-    parallelWork(count, progress, size, "下载", true, [&](int id, const std::atomic<bool>& cancel) {
-        const auto first = size * id / count;
-        const auto length = size * (id + 1) / count - first;
-        for (int attempt = 0; attempt < 3; ++attempt) {
-            try {
-                require(!cancel, "Download cancelled because another worker failed");
-                progress[id].count = 0;
-                auto headers = L"Range: bytes=" + std::to_wstring(first) + L"-" + std::to_wstring(first + length - 1) + L"\r\n";
-                if (!etag.empty()) headers += L"If-Match: " + wide(etag) + L"\r\n";
-                http::Request request(remote.url, headers);
-                updater::validateRange(request.status(), request.header(HTTP_QUERY_CONTENT_RANGE), first, length, size);
-                const auto contentLength = request.header(HTTP_QUERY_CONTENT_LENGTH);
-                require(contentLength.empty() || updater::number(contentLength) == length, "Segment Content-Length mismatch");
-                std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
-                require(f.good(), "Cannot open segment output file");
-                f.seekp(static_cast<std::streamoff>(first));
-                require(f.good(), "Cannot seek segment output file");
-                updater::copyResponse([&](char* p, std::size_t n) {
-                    require(!cancel, "Download cancelled");
-                    return request.read(p, n);
-                }, [&](const char* p, std::size_t n) {
-                    f.write(p, n);
-                    require(f.good(), "Segment write failed");
-                    progress[id].count += n;
-                }, length, length);
-                f.flush();
-                require(f.good(), "Segment flush failed");
-                f.close();
-                require(!f.fail(), "Segment close failed");
-                return;
-            } catch (...) {
-                if (attempt == 2 || cancel.load()) throw;
-                std::this_thread::sleep_for(std::chrono::milliseconds(300 * (1 << attempt)));
+    progress[0].count = existingBytes;
+
+    std::atomic<std::size_t> nextJobIndex{0};
+    std::mutex metaMutex;
+
+    auto saveMeta = [&]() {
+        std::lock_guard<std::mutex> lock(metaMutex);
+        std::vector<std::size_t> doneIndices;
+        doneIndices.reserve(totalChunks);
+        for (std::size_t i = 0; i < totalChunks; ++i) {
+            if (chunkCompleted[i]) doneIndices.push_back(i);
+        }
+        json meta = {
+            {"url", remote.url},
+            {"etag", etag},
+            {"size", size},
+            {"chunkSize", chunkSize},
+            {"sha256", remote.sha256},
+            {"completed", doneIndices}
+        };
+        try {
+            writeJson(metaPath, meta);
+        } catch (...) {}
+    };
+
+    parallelWork(count, progress, size, "分段断点下载", true, [&](int id, const std::atomic<bool>& cancel) {
+        while (!cancel) {
+            const auto jobIdx = nextJobIndex.fetch_add(1);
+            if (jobIdx >= jobs.size()) return;
+            const auto& job = jobs[jobIdx];
+
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                try {
+                    require(!cancel, "Download cancelled because another worker failed");
+                    auto headers = L"Range: bytes=" + std::to_wstring(job.offset) + L"-" + std::to_wstring(job.offset + job.length - 1) + L"\r\n";
+                    if (!etag.empty()) headers += L"If-Match: " + wide(etag) + L"\r\n";
+                    http::Request request(remote.url, headers);
+                    updater::validateRange(request.status(), request.header(HTTP_QUERY_CONTENT_RANGE), job.offset, job.length, size);
+                    const auto contentLength = request.header(HTTP_QUERY_CONTENT_LENGTH);
+                    require(contentLength.empty() || updater::number(contentLength) == job.length, "Segment Content-Length mismatch");
+
+                    std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+                    require(f.good(), "Cannot open segment output file");
+                    f.seekp(static_cast<std::streamoff>(job.offset));
+                    require(f.good(), "Cannot seek segment output file");
+
+                    updater::copyResponse([&](char* p, std::size_t n) {
+                        require(!cancel, "Download cancelled");
+                        return request.read(p, n);
+                    }, [&](const char* p, std::size_t n) {
+                        f.write(p, n);
+                        require(f.good(), "Segment write failed");
+                        progress[id].count += n;
+                    }, job.length, job.length);
+
+                    f.flush();
+                    require(f.good(), "Segment flush failed");
+                    f.close();
+                    require(!f.fail(), "Segment close failed");
+
+                    {
+                        std::lock_guard<std::mutex> lock(metaMutex);
+                        chunkCompleted[job.index] = true;
+                    }
+                    if (jobIdx % 5 == 0 || jobIdx + 1 == jobs.size()) {
+                        saveMeta();
+                    }
+                    break;
+                } catch (...) {
+                    if (attempt == 2 || cancel.load()) throw;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(300 * (1 << attempt)));
+                }
             }
         }
     });
+
+    saveMeta();
     require(fs::file_size(path) == size, "Final archive size mismatch");
+    std::error_code ec;
+    fs::remove(metaPath, ec);
 }
 
 void download(const Remote& remote, const fs::path& file, int threads) {
@@ -1449,7 +1597,7 @@ int run(const updater::Options& options) {
     }
 
     if (!streamed) {
-        ui.steps[ModernUI::STEP_EXTRACT].name = "分段下载与并行解压";
+        ui.steps[ModernUI::STEP_EXTRACT].name = "分段下载与断点续传";
         ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Active, "多线程下载安装包...");
         download(remote, zip, threads);
         ui.setStep(ModernUI::STEP_VERIFY, StepStatus::Success, "SHA-256 核验一致");
