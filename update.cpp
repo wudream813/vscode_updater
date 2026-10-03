@@ -1494,7 +1494,7 @@ struct Zip {
     Zip& operator=(const Zip&) = delete;
 };
 
-struct Entry { mz_uint index; fs::path relative; std::uint64_t size; bool directory; };
+struct Entry { mz_uint index; fs::path relative; std::uint64_t size; bool directory; std::string u8Name; };
 struct ZipPlan { std::vector<Entry> entries; std::uint64_t expanded = 0; };
 
 ZipPlan inspectZip(const fs::path& file) {
@@ -1520,7 +1520,7 @@ ZipPlan inspectZip(const fs::path& file) {
         plan.expanded += st.m_uncomp_size;
         const auto relative = fs::path(wide(safe));
         require(names.emplace(relative.generic_wstring(), directory).second, "Duplicate/case-colliding ZIP entry");
-        plan.entries.push_back({i, relative, st.m_uncomp_size, directory});
+        plan.entries.push_back({i, relative, st.m_uncomp_size, directory, safe});
     }
     for (const auto& entry : plan.entries) {
         for (auto parent = entry.relative.parent_path(); !parent.empty(); parent = parent.parent_path()) {
@@ -1588,7 +1588,7 @@ void extractZip(const fs::path& file, const fs::path& target, const ZipPlan& pla
             const bool ok = mz_zip_reader_extract_to_callback(&zip.archive, entry.index, extractWrite, &sink, 0) != 0;
             require(ok && !sink.failed && sink.written == entry.size, "ZIP extraction/CRC/write failed: " + pathText(entry.relative));
             finishFile(sink.file);
-            lastExtractedName.store(entry.relative.string().c_str());
+            lastExtractedName.store(entry.u8Name.c_str());
             ++progress[id].count;
         }
         throw std::runtime_error("Extraction cancelled");
