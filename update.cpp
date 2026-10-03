@@ -88,6 +88,9 @@ std::string padBoxLine(const std::string& content, int innerWidth) {
     return "  │" + content + std::string(pad, ' ') + "│\n";
 }
 
+
+std::atomic<bool> g_interruptRequested{false};
+
 enum class StepStatus {
     Pending,
     Active,
@@ -152,15 +155,19 @@ public:
                     std::cout << "\033[?1049h\033[2J\033[H\033[?25l" << std::flush;
                     inAltScreen = true;
 
-                    // Register console control handler to restore primary screen on Ctrl+C / close
+                    // Register console control handler for graceful Ctrl+C interruption
                     SetConsoleCtrlHandler([](DWORD signal) -> BOOL {
-                        if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT || signal == CTRL_CLOSE_EVENT) {
+                        if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT) {
+                            g_interruptRequested.store(true);
+                            return TRUE; // Handled! Give worker threads a chance to pause and show prompt
+                        }
+                        if (signal == CTRL_CLOSE_EVENT) {
                             HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
                             DWORD w = 0;
                             const char seq[] = "\033[?25h\033[?1049l\n";
                             WriteConsoleA(h, seq, sizeof(seq) - 1, &w, nullptr);
                         }
-                        return FALSE; // Allow default termination
+                        return FALSE;
                     }, TRUE);
                 }
             }
@@ -337,6 +344,50 @@ public:
             }
             if (ch == 'n' || ch == 'N' || ch == 27 || ch == '\r' || ch == '\n') {
                 return false;
+            }
+        }
+    }
+
+    bool promptCancelOrExit(const std::string& actionName) {
+        if (!enabled) {
+            std::cout << "\n检测到中断信号 (Ctrl+C)。是否退出当前" << actionName << "？[Y/n]: " << std::flush;
+            std::string line;
+            if (std::getline(std::cin, line)) {
+                return line.empty() || line[0] == 'y' || line[0] == 'Y';
+            }
+            return true;
+        }
+
+        const int innerW = 58;
+        std::cout << "\033[13;1H";
+        std::cout << (colorSupported ? "\033[1;33m" : "")
+                  << "  ┌──────────────────────────────────────────────────────────┐\n"
+                  << (colorSupported ? "\033[0m" : "");
+        std::cout << padBoxLine("                      中断操作提示", innerW);
+        std::cout << (colorSupported ? "\033[1;33m" : "")
+                  << "  ├──────────────────────────────────────────────────────────┤\n"
+                  << (colorSupported ? "\033[0m" : "");
+        std::cout << padBoxLine("  检测到用户键盘中断信号 (Ctrl+C)", innerW);
+        std::cout << padBoxLine("  当前正在执行: " + actionName, innerW);
+        std::cout << padBoxLine("  已完成的进度与数据均已安全暂存，支持断点续传。", innerW);
+        std::cout << padBoxLine("", innerW);
+        std::cout << padBoxLine("  请选择下一步操作：", innerW);
+        std::cout << padBoxLine("", innerW);
+        std::cout << padBoxLine("      [Y] 强制退出 / 取消下载      [C] 继续当前任务", innerW);
+        std::cout << (colorSupported ? "\033[1;33m" : "")
+                  << "  └──────────────────────────────────────────────────────────┘\n"
+                  << (colorSupported ? "\033[0m" : "") << std::flush;
+
+        while (true) {
+            int ch = _getch();
+            if (ch == 'y' || ch == 'Y' || ch == 27 || ch == '\r' || ch == '\n') {
+                return true; // Exit
+            }
+            if (ch == 'c' || ch == 'C' || ch == 'n' || ch == 'N') {
+                // Clear modal and resume
+                std::cout << "\033[13;1H\033[J" << std::flush;
+                g_interruptRequested.store(false);
+                return false; // Continue
             }
         }
     }
@@ -767,6 +818,15 @@ void parallelWork(int count, std::vector<Progress>& progress, std::uint64_t tota
         throw;
     }
     while (done.load() != count) {
+        if (g_interruptRequested.load()) {
+            bool shouldExit = ui.promptCancelOrExit(title);
+            if (shouldExit) {
+                cancel = true;
+                for (auto& t : workers) t.join();
+                ui.finish(false, "用户已强制退出 / 取消");
+                exit(130);
+            }
+        }
         if (interactiveOutput) {
             std::uint64_t current = 0;
             for (auto& p : progress) current += p.count.load();
@@ -1503,6 +1563,7 @@ void extractZip(const fs::path& file, const fs::path& target, const ZipPlan& pla
     std::vector<Progress> progress(count);
     progress[0].count = alreadyExtracted;
 
+    std::atomic<const char*> lastExtractedName{""};
     parallelWork(count, progress, totalFiles, "断点解压", false, [&](int id, const std::atomic<bool>& cancel) {
         Zip zip(file);
         while (!cancel) {
@@ -1517,6 +1578,7 @@ void extractZip(const fs::path& file, const fs::path& target, const ZipPlan& pla
             const bool ok = mz_zip_reader_extract_to_callback(&zip.archive, entry.index, extractWrite, &sink, 0) != 0;
             require(ok && !sink.failed && sink.written == entry.size, "ZIP extraction/CRC/write failed: " + pathText(entry.relative));
             finishFile(sink.file);
+            lastExtractedName.store(entry.relative.string().c_str());
             ++progress[id].count;
         }
         throw std::runtime_error("Extraction cancelled");
@@ -1634,13 +1696,11 @@ int run(const updater::Options& options) {
     require(lock.value != INVALID_HANDLE_VALUE, "Another updater is using this target, or the parent directory is not writable");
     ensureNotRunning(target);
 
-    Workspace workspace(target);
     const auto cacheDir = target.parent_path() / (L"." + target.filename().native() + L".cache");
     fs::create_directories(cacheDir);
     const auto zip = cacheDir / (L"vscode-" + wide(remote.id.version) + L"-" + wide(remote.id.commit.substr(0, 10)) + L".zip");
     const auto staged = cacheDir / (L"staged-" + wide(remote.id.version) + L"-" + wide(remote.id.commit.substr(0, 10)));
-    const auto backup = workspace.root / "previous";
-    fs::create_directory(staged);
+    fs::create_directories(staged);
     const int automatic = static_cast<int>(std::min(8u, std::max(1u, std::thread::hardware_concurrency())));
     const int threads = options.threads ? options.threads : automatic;
     const auto portableBytes = dataSize(target / "data");
@@ -1666,7 +1726,7 @@ int run(const updater::Options& options) {
             if (probe.supportsRange && probe.totalSize > 0 && probe.totalSize <= updater::maxArchiveBytes) {
                 const auto streamPlan = fetchAndPlanCentralDirectory(remote.url, probe.totalSize, probe.etag);
                 if (streamPlan.isSequential) {
-                    const auto freeBytes = fs::space(workspace.root).available;
+                    const auto freeBytes = fs::space(target.parent_path()).available;
                     require(freeBytes > reserve && streamPlan.expanded <= freeBytes - reserve &&
                             portableBytes <= freeBytes - reserve - streamPlan.expanded,
                             "Not enough disk space for streaming extraction and portable user data");
@@ -1706,7 +1766,7 @@ int run(const updater::Options& options) {
         // 3. Inspect ZIP and security audit
         ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Active, "解包目录安全审计...");
         const auto plan = inspectZip(zip);
-        const auto freeBytes = fs::space(workspace.root).available;
+        const auto freeBytes = fs::space(target.parent_path()).available;
         require(freeBytes > reserve && plan.expanded <= freeBytes - reserve && portableBytes <= freeBytes - reserve - plan.expanded,
                 "Not enough disk space for extraction and a copy of portable user data");
         ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Success, "安全校验通过 (" + std::to_string(plan.entries.size()) + " files)");
@@ -1720,6 +1780,10 @@ int run(const updater::Options& options) {
     const auto stagedIdentity = localIdentity(staged);
     require(updater::sameBuild(stagedIdentity, remote.id), "Extracted VS Code version/commit/channel/architecture does not match official metadata");
     ensureNotRunning(target);
+
+    // Only create ephemeral switch workspace when all files are 100% verified and ready
+    Workspace workspace(target);
+    const auto backup = workspace.root / "previous";
 
     ui.setStep(ModernUI::STEP_APPLY, StepStatus::Active, "保留 portable data 目录...");
     copyData(target / "data", staged / "data");
