@@ -982,6 +982,16 @@ void downloadOnce(const Remote& remote, const fs::path& path, int requestedThrea
 }
 
 void download(const Remote& remote, const fs::path& file, int threads) {
+    // If complete, valid archive already exists in persistent cache, skip re-downloading entirely!
+    std::error_code ec;
+    if (fs::exists(file, ec) && fs::file_size(file, ec) > 0) {
+        try {
+            if (sha256(file) == remote.sha256) {
+                return;
+            }
+        } catch (...) {}
+    }
+
     // Segment retries preserve completed ranges. An overall failure gets one fresh retry.
     for (int attempt = 0; attempt < 2; ++attempt) {
         try {
@@ -1637,28 +1647,75 @@ int run(const updater::Options& options) {
     const std::uint64_t reserve = 64ULL * 1024 * 1024;
     bool streamed = false;
 
-    // 1. Download stage with multi-chunk resumable downloading
-    ui.setStep(ModernUI::STEP_DOWNLOAD, StepStatus::Active, "多线程分段断点下载...");
-    download(remote, zip, threads);
-    ui.setStep(ModernUI::STEP_DOWNLOAD, StepStatus::Success, "下载完成 (已缓存)");
+    bool alreadyHasValidZip = false;
+    {
+        std::error_code ec;
+        if (fs::exists(zip, ec) && fs::file_size(zip, ec) > 0) {
+            try {
+                if (sha256(zip) == remote.sha256) alreadyHasValidZip = true;
+            } catch (...) {}
+        }
+    }
 
-    // 2. Hash verification
-    ui.setStep(ModernUI::STEP_VERIFY, StepStatus::Active, "核验官方 SHA-256...");
-    require(sha256(zip) == remote.sha256, "SHA-256 mismatch; refusing to install this archive");
-    ui.setStep(ModernUI::STEP_VERIFY, StepStatus::Success, "SHA-256 核验一致");
+    if (options.stream && !options.keepZip && !alreadyHasValidZip) {
+        // Stream mode requested and no complete archive cached yet
+        ui.steps[ModernUI::STEP_DOWNLOAD].name = "边下载边解压 (流式)";
+        ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Active, "探测分段支持与中央目录...");
+        try {
+            const auto probe = probeRemote(remote.url);
+            if (probe.supportsRange && probe.totalSize > 0 && probe.totalSize <= updater::maxArchiveBytes) {
+                const auto streamPlan = fetchAndPlanCentralDirectory(remote.url, probe.totalSize, probe.etag);
+                if (streamPlan.isSequential) {
+                    const auto freeBytes = fs::space(workspace.root).available;
+                    require(freeBytes > reserve && streamPlan.expanded <= freeBytes - reserve &&
+                            portableBytes <= freeBytes - reserve - streamPlan.expanded,
+                            "Not enough disk space for streaming extraction and portable user data");
+                    ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Success, "安全校验通过 (" + std::to_string(streamPlan.entries.size()) + " files)");
+                    ui.setStep(ModernUI::STEP_DOWNLOAD, StepStatus::Active, "流式提取中 (边下边解)...");
+                    streamDownloadAndExtract(remote, staged, zip, streamPlan, probe.totalSize, probe.etag);
+                    ui.setStep(ModernUI::STEP_DOWNLOAD, StepStatus::Success, "流式传输与提取完成");
+                    ui.setStep(ModernUI::STEP_VERIFY, StepStatus::Success, "SHA-256 核验一致");
+                    ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Success, "全部文件提取就绪 (" + std::to_string(streamPlan.entries.size()) + " files)");
+                    streamed = true;
+                } else {
+                    ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Success, "非顺序排列，回退普通分段");
+                }
+            } else {
+                ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Success, "不支持分段，回退常规下载");
+            }
+        } catch (const std::exception& e) {
+            ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Failed, e.what());
+        }
+    }
 
-    // 3. Inspect ZIP and security audit
-    ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Active, "解包目录安全审计...");
-    const auto plan = inspectZip(zip);
-    const auto freeBytes = fs::space(workspace.root).available;
-    require(freeBytes > reserve && plan.expanded <= freeBytes - reserve && portableBytes <= freeBytes - reserve - plan.expanded,
-            "Not enough disk space for extraction and a copy of portable user data");
-    ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Success, "安全校验通过 (" + std::to_string(plan.entries.size()) + " files)");
+    if (!streamed) {
+        // 1. Download stage with multi-chunk resumable downloading
+        if (alreadyHasValidZip) {
+            ui.setStep(ModernUI::STEP_DOWNLOAD, StepStatus::Success, "完整安装包已就绪 (无需重复下载)");
+        } else {
+            ui.setStep(ModernUI::STEP_DOWNLOAD, StepStatus::Active, "多线程分段断点下载...");
+            download(remote, zip, threads);
+            ui.setStep(ModernUI::STEP_DOWNLOAD, StepStatus::Success, "下载完成 (已缓存)");
+        }
 
-    // 4. Resumable multi-threaded extraction
-    ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Active, "解压释放并就绪...");
-    extractZip(zip, staged, plan, threads);
-    ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Success, "全部解压就绪 (" + std::to_string(plan.entries.size()) + " files)");
+        // 2. Hash verification
+        ui.setStep(ModernUI::STEP_VERIFY, StepStatus::Active, "核验官方 SHA-256...");
+        require(sha256(zip) == remote.sha256, "SHA-256 mismatch; refusing to install this archive");
+        ui.setStep(ModernUI::STEP_VERIFY, StepStatus::Success, "SHA-256 核验一致");
+
+        // 3. Inspect ZIP and security audit
+        ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Active, "解包目录安全审计...");
+        const auto plan = inspectZip(zip);
+        const auto freeBytes = fs::space(workspace.root).available;
+        require(freeBytes > reserve && plan.expanded <= freeBytes - reserve && portableBytes <= freeBytes - reserve - plan.expanded,
+                "Not enough disk space for extraction and a copy of portable user data");
+        ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Success, "安全校验通过 (" + std::to_string(plan.entries.size()) + " files)");
+
+        // 4. Resumable multi-threaded extraction
+        ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Active, "解压释放并就绪...");
+        extractZip(zip, staged, plan, threads);
+        ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Success, "全部解压就绪 (" + std::to_string(plan.entries.size()) + " files)");
+    }
 
     const auto stagedIdentity = localIdentity(staged);
     require(updater::sameBuild(stagedIdentity, remote.id), "Extracted VS Code version/commit/channel/architecture does not match official metadata");
