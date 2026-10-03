@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
         extractZip(fixtures / "valid.zip", output, valid, 2);
         check(contents(output / "folder/hello.txt") == "hello", "ZIP contents");
         check(fs::file_size(output / "empty.txt") == 0, "empty file extraction");
-        check(contents(output / fs::path(L"中文/说明.txt")) == u8"安全测试", "Unicode path extraction");
+        check(contents(output / fs::path(L"中文/说明.txt")) == reinterpret_cast<const char*>(u8"安全测试"), "Unicode path extraction");
         for (const auto* name : {"traversal.zip", "absolute.zip", "case-collision.zip", "conflict.zip", "data.zip", "reserved.zip", "symlink.zip", "truncated.zip"})
             rejects([&] { inspectZip(fixtures / name); }, "unsafe ZIP accepted");
         check(!fs::exists(work.root / "escaped.txt") && !fs::exists(fixtures / "escaped.txt"), "ZIP traversal escaped");

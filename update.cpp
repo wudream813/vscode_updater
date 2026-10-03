@@ -798,7 +798,8 @@ struct Progress {
 
 // Every worker catches exceptions. Even partial thread creation is joined safely.
 template<class Work>
-void parallelWork(int count, std::vector<Progress>& progress, std::uint64_t total, const char* title, bool byteProgress, Work work) {
+void parallelWork(int count, std::vector<Progress>& progress, std::uint64_t total, const char* title, bool byteProgress,
+                  const std::atomic<const char*>* currentItem, Work work) {
     const auto started = std::chrono::steady_clock::now();
     std::atomic<bool> cancel{false};
     std::atomic<int> done{0};
@@ -838,7 +839,8 @@ void parallelWork(int count, std::vector<Progress>& progress, std::uint64_t tota
                 if (byteProgress) {
                     ui.renderDashboard(ratio, current / 1048576.0, total / 1048576.0, rate / 1048576.0, eta);
                 } else {
-                    ui.renderDashboard(ratio, 0.0, 0.0, 0.0, eta, current, total);
+                    const char* curFile = currentItem ? currentItem->load() : "";
+                    ui.renderDashboard(ratio, 0.0, 0.0, 0.0, eta, current, total, curFile ? curFile : "");
                 }
             } else {
                 std::ostringstream line;
@@ -984,7 +986,7 @@ void downloadOnce(const Remote& remote, const fs::path& path, int requestedThrea
         } catch (...) {}
     };
 
-    parallelWork(count, progress, size, "分段断点下载", true, [&](int id, const std::atomic<bool>& cancel) {
+    parallelWork(count, progress, size, "分段断点下载", true, nullptr, [&](int id, const std::atomic<bool>& cancel) {
         while (!cancel) {
             const auto jobIdx = nextJobIndex.fetch_add(1);
             if (jobIdx >= jobs.size()) return;
@@ -1417,6 +1419,14 @@ void streamDownloadAndExtract(const Remote& remote, const fs::path& staged, cons
     std::uint64_t lastMetaBytes = 0;
     std::vector<std::uint8_t> buffer(64 * 1024);
     while (bytesReceived < totalSize) {
+        if (g_interruptRequested.load()) {
+            bool shouldExit = ui.promptCancelOrExit("流式下载与解压");
+            if (shouldExit) {
+                finishFile(zipFile);
+                ui.finish(false, "用户已强制退出 / 取消");
+                exit(130);
+            }
+        }
         const std::size_t toRead = std::min<std::size_t>(buffer.size(), static_cast<std::size_t>(totalSize - bytesReceived));
         const std::size_t n = req.read(reinterpret_cast<char*>(buffer.data()), toRead);
         require(n > 0, "Unexpected early EOF during streaming download");
@@ -1564,7 +1574,7 @@ void extractZip(const fs::path& file, const fs::path& target, const ZipPlan& pla
     progress[0].count = alreadyExtracted;
 
     std::atomic<const char*> lastExtractedName{""};
-    parallelWork(count, progress, totalFiles, "断点解压", false, [&](int id, const std::atomic<bool>& cancel) {
+    parallelWork(count, progress, totalFiles, "断点解压", false, &lastExtractedName, [&](int id, const std::atomic<bool>& cancel) {
         Zip zip(file);
         while (!cancel) {
             const auto n = next.fetch_add(1);
@@ -1720,7 +1730,7 @@ int run(const updater::Options& options) {
     if (options.stream && !options.keepZip && !alreadyHasValidZip) {
         // Stream mode requested and no complete archive cached yet
         ui.steps[ModernUI::STEP_DOWNLOAD].name = "边下载边解压 (流式)";
-        ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Active, "探测分段支持与中央目录...");
+        ui.setStep(ModernUI::STEP_DOWNLOAD, StepStatus::Active, "探测分段支持并预读中央目录...");
         try {
             const auto probe = probeRemote(remote.url);
             if (probe.supportsRange && probe.totalSize > 0 && probe.totalSize <= updater::maxArchiveBytes) {
@@ -1738,13 +1748,13 @@ int run(const updater::Options& options) {
                     ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Success, "全部文件提取就绪 (" + std::to_string(streamPlan.entries.size()) + " files)");
                     streamed = true;
                 } else {
-                    ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Success, "非顺序排列，回退普通分段");
+                    ui.setStep(ModernUI::STEP_DOWNLOAD, StepStatus::Active, "非顺序排列，转为常规分段");
                 }
             } else {
-                ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Success, "不支持分段，回退常规下载");
+                ui.setStep(ModernUI::STEP_DOWNLOAD, StepStatus::Active, "不支持分段，转为常规下载");
             }
         } catch (const std::exception& e) {
-            ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Failed, e.what());
+            ui.setStep(ModernUI::STEP_DOWNLOAD, StepStatus::Active, "预检未通过，转为常规下载");
         }
     }
 
