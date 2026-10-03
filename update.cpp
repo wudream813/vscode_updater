@@ -1288,21 +1288,29 @@ void streamDownloadAndExtract(const Remote& remote, const fs::path& staged, cons
         safeAncestors(filePath.parent_path());
         rejectReparse(filePath);
         fs::create_directories(filePath.parent_path());
+        // Resumable stream unpack: if already cleanly extracted with exact size, skip re-extracting
+        std::error_code ec;
+        if (fs::exists(filePath, ec) && fs::file_size(filePath, ec) == entry.uncompSize) {
+            currentFilePath.clear();
+            return;
+        }
         currentFile.open(filePath, std::ios::binary | std::ios::trunc);
         require(currentFile.good(), "Cannot create extracted file: " + pathText(filePath));
         currentFilePath = filePath;
     };
 
     auto onFileData = [&](const std::uint8_t* chunk, std::size_t len) {
-        currentFile.write(reinterpret_cast<const char*>(chunk), static_cast<std::streamsize>(len));
-        require(currentFile.good(), "Write failed for " + pathText(currentFilePath));
+        if (currentFile.is_open()) {
+            currentFile.write(reinterpret_cast<const char*>(chunk), static_cast<std::streamsize>(len));
+            require(currentFile.good(), "Write failed for " + pathText(currentFilePath));
+        }
     };
 
     auto onFileEnd = [&](const updater::PlannedEntry&) {
         if (currentFile.is_open()) {
             finishFile(currentFile);
-            ++extractedCount;
         }
+        ++extractedCount;
     };
 
     // Download sequential stream
@@ -1459,18 +1467,33 @@ size_t extractWrite(void* opaque, mz_uint64 offset, const void* buffer, size_t c
 
 void extractZip(const fs::path& file, const fs::path& target, const ZipPlan& plan, int threadCount) {
     std::vector<const Entry*> jobs;
+    std::size_t alreadyExtracted = 0;
     for (const auto& entry : plan.entries) {
         const auto output = target / entry.relative;
         require(pathWithin(output, target), "ZIP output escaped staging directory");
         fs::create_directories(entry.directory ? output : output.parent_path());
-        if (!entry.directory) jobs.push_back(&entry);
+        if (!entry.directory) {
+            // Check if file is already completely extracted in previous attempt (resumable extraction)
+            std::error_code ec;
+            if (fs::exists(output, ec) && fs::is_regular_file(output, ec) && fs::file_size(output, ec) == entry.size) {
+                ++alreadyExtracted;
+            } else {
+                jobs.push_back(&entry);
+            }
+        }
     }
-    require(!jobs.empty(), "ZIP contains no files");
+    const std::size_t totalFiles = plan.entries.size();
+    if (jobs.empty()) {
+        if (interactiveOutput && !ui.enabled) std::cout << "\r断点解压: 全部 " << totalFiles << " 个文件已就绪                                                            \n";
+        return;
+    }
     std::sort(jobs.begin(), jobs.end(), [](const Entry* a, const Entry* b) { return a->size > b->size; });
     const int count = static_cast<int>(std::min<std::size_t>(threadCount, jobs.size()));
     std::atomic<std::size_t> next{0};
     std::vector<Progress> progress(count);
-    parallelWork(count, progress, jobs.size(), "解压", false, [&](int id, const std::atomic<bool>& cancel) {
+    progress[0].count = alreadyExtracted;
+
+    parallelWork(count, progress, totalFiles, "断点解压", false, [&](int id, const std::atomic<bool>& cancel) {
         Zip zip(file);
         while (!cancel) {
             const auto n = next.fetch_add(1);
@@ -1607,7 +1630,8 @@ int run(const updater::Options& options) {
     const auto cacheDir = target.parent_path() / (L"." + target.filename().native() + L".cache");
     fs::create_directories(cacheDir);
     const auto zip = cacheDir / (L"vscode-" + wide(remote.id.version) + L"-" + wide(remote.id.commit.substr(0, 10)) + L".zip");
-    const auto staged = workspace.root / "staged", backup = workspace.root / "previous";
+    const auto staged = cacheDir / (L"staged-" + wide(remote.id.version) + L"-" + wide(remote.id.commit.substr(0, 10)));
+    const auto backup = workspace.root / "previous";
     fs::create_directory(staged);
     const int automatic = static_cast<int>(std::min(8u, std::max(1u, std::thread::hardware_concurrency())));
     const int threads = options.threads ? options.threads : automatic;
@@ -1640,9 +1664,7 @@ int run(const updater::Options& options) {
             }
         } catch (const std::exception& e) {
             ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Failed, e.what());
-            std::error_code ec;
-            fs::remove_all(staged, ec);
-            fs::create_directory(staged, ec);
+            // Keep intact files for resumable extraction
         }
     }
 
