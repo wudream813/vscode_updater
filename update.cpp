@@ -1264,7 +1264,7 @@ updater::ZipStreamPlan fetchAndPlanCentralDirectory(const std::string& url, std:
 }
 
 // Stream download while inflating and hashing in one pass
-void streamDownloadAndExtract(const Remote& remote, const fs::path& staged,
+void streamDownloadAndExtract(const Remote& remote, const fs::path& staged, const fs::path& zipPath,
                              const updater::ZipStreamPlan& plan, std::uint64_t totalSize, const std::string& etag) {
     ZipStreamUnpacker unpacker(plan);
     Sha256Hasher hasher;
@@ -1312,15 +1312,47 @@ void streamDownloadAndExtract(const Remote& remote, const fs::path& staged,
     http::Request req(remote.url, headers);
     updater::validateRange(req.status(), req.header(HTTP_QUERY_CONTENT_RANGE), 0, totalSize, totalSize);
 
+    const std::uint64_t chunkSize = 2ULL * 1024 * 1024;
+    // total chunks computed on demand
+    const auto metaPath = zipPath.string() + ".part.json";
+    std::ofstream zipFile(zipPath, std::ios::binary | std::ios::trunc);
+    require(zipFile.good(), "Cannot create archive cache file");
+
+    auto saveStreamMeta = [&](std::uint64_t currentBytes) {
+        std::vector<std::size_t> doneIndices;
+        std::size_t fullChunks = static_cast<std::size_t>(currentBytes / chunkSize);
+        doneIndices.reserve(fullChunks);
+        for (std::size_t i = 0; i < fullChunks; ++i) doneIndices.push_back(i);
+        json meta = {
+            {"url", remote.url},
+            {"etag", etag},
+            {"size", totalSize},
+            {"chunkSize", chunkSize},
+            {"sha256", remote.sha256},
+            {"completed", doneIndices}
+        };
+        try {
+            writeJson(metaPath, meta);
+        } catch (...) {}
+    };
+
+    std::uint64_t lastMetaBytes = 0;
     std::vector<std::uint8_t> buffer(64 * 1024);
     while (bytesReceived < totalSize) {
         const std::size_t toRead = std::min<std::size_t>(buffer.size(), static_cast<std::size_t>(totalSize - bytesReceived));
         const std::size_t n = req.read(reinterpret_cast<char*>(buffer.data()), toRead);
         require(n > 0, "Unexpected early EOF during streaming download");
 
+        zipFile.write(reinterpret_cast<const char*>(buffer.data()), static_cast<std::streamsize>(n));
         hasher.update(buffer.data(), n);
         unpacker.feed(bytesReceived, buffer.data(), n, onDir, onFileStart, onFileData, onFileEnd);
         bytesReceived += n;
+
+        if (bytesReceived - lastMetaBytes >= chunkSize) {
+            zipFile.flush();
+            saveStreamMeta(bytesReceived);
+            lastMetaBytes = bytesReceived;
+        }
 
         if (interactiveOutput) {
             const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -1349,11 +1381,14 @@ void streamDownloadAndExtract(const Remote& remote, const fs::path& staged,
         std::cout << "\r边下边解: 完成 (已提取 " << extractedCount << " 个文件)                                              \n";
     }
 
+    finishFile(zipFile);
     require(unpacker.isComplete(), "Incomplete archive decompression");
     ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Success, "已提取 " + std::to_string(extractedCount) + " 个文件");
     ui.setStep(ModernUI::STEP_VERIFY, StepStatus::Active, "计算哈希值...");
     const std::string computedSha = hasher.finish();
     require(computedSha == remote.sha256, "SHA-256 mismatch; stream integrity verification failed");
+    std::error_code ec;
+    fs::remove(metaPath, ec);
 }
 
 struct Zip {
@@ -1594,7 +1629,7 @@ int run(const updater::Options& options) {
                             "Not enough disk space for streaming extraction and portable user data");
                     ui.setStep(ModernUI::STEP_AUDIT, StepStatus::Success, "安全校验通过 (" + std::to_string(streamPlan.entries.size()) + " files)");
                     ui.setStep(ModernUI::STEP_EXTRACT, StepStatus::Active, "流式提取中...");
-                    streamDownloadAndExtract(remote, staged, streamPlan, probe.totalSize, probe.etag);
+                    streamDownloadAndExtract(remote, staged, zip, streamPlan, probe.totalSize, probe.etag);
                     ui.setStep(ModernUI::STEP_VERIFY, StepStatus::Success, "SHA-256 核验一致");
                     streamed = true;
                 } else {
